@@ -1,59 +1,43 @@
-name: 每日股票分析（选股+分版面）
+name: 东方财富实时选股 + 分版面分析
 
 on:
-  # 定时触发：工作日早9点（开盘前）+ 晚18点（收盘后）
+  # 盘中实时选股（A股交易时段）
   schedule:
-    - cron: "0 1 * * 1-5"  # 北京时间 09:00（UTC 01:00）
-    - cron: "0 10 * * 1-5" # 北京时间 18:00（UTC 10:00）
-  # 手动触发（保留测试功能）
+    - cron: "30 1 * * 1-5"  # 北京时间 9:30（开盘后）
+    - cron: "30 2 * * 1-5"  # 北京时间 10:30
+    - cron: "0 6 * * 1-5"   # 北京时间 14:00（下午开盘）
+  # 盘后复盘
+  - cron: "0 10 * * 1-5"   # 北京时间 18:00
+  # 手动触发（测试用）
   workflow_dispatch:
-    inputs:
-      mode:
-        description: '运行模式'
-        required: true
-        default: 'full'
-        options:
-          - full
-          - market-only
-          - stocks-only
-      force_run:
-        description: '强制运行（跳过交易日检查）'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # 设置北京时间时区 + 加载Secrets
+    # 加载Secrets + 设置北京时间
     env:
       TZ: Asia/Shanghai
       FIXED_STOCK_LIST: ${{ secrets.FIXED_STOCK_LIST }}
-      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      MODEL_NAME: ${{ secrets.MODEL_NAME }}
-      WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
     steps:
       # 步骤1：检出代码
-      - name: 检出代码
+      - name: 检出仓库代码
         uses: actions/checkout@v4
 
       # 步骤2：设置Python环境
-      - name: 设置Python
+      - name: 配置Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      # 步骤3：安装依赖（新增tushare）
-      - name: 安装依赖
+      # 步骤3：安装依赖（仅需requests）
+      - name: 安装依赖包
         run: |
           pip install --upgrade pip
-          pip install tushare pandas openpyxl python-dotenv
+          pip install requests pandas
 
-      # 步骤4：执行选股+分析
-      - name: 执行选股和分版面分析
+      # 步骤4：执行实时选股+分版面分析
+      - name: 运行选股程序
         run: python main.py
 
       # 步骤5：上传报告（保留30天）
@@ -61,19 +45,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: split-analysis-report-${{ github.run_number }}
+          name: 东方财富选股报告-${{ github.run_number }}
           path: reports/
           retention-days: 30
-
-      # 步骤6：显示运行结果
-      - name: 打印报告预览
-        if: always()
-        run: |
-          echo "====================================="
-          echo "📊 分版面报告预览（前20行）"
-          echo "====================================="
-          if [ -f "$(ls reports/*.txt | head -1)" ]; then
-            head -20 $(ls reports/*.txt | head -1)
-          else
-            echo "⚠️ 未生成报告文件"
-          fi
