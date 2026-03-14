@@ -1,50 +1,42 @@
-name: 东方财富实时选股 + 分版面分析
+name: 短线交易三模块分析（早盘+持仓+尾盘）
 
 on:
-  # 盘中实时选股（A股交易时段）
-  schedule:
-    - cron: "30 1 * * 1-5"  # 北京时间 9:30（开盘后）
-    - cron: "30 2 * * 1-5"  # 北京时间 10:30
-    - cron: "0 6 * * 1-5"   # 北京时间 14:00（下午开盘）
-  # 盘后复盘
-  - cron: "0 10 * * 1-5"   # 北京时间 18:00
+  # 1. 早盘分析（9:25-9:30，竞价结束后）
+  - cron: "28 1 * * 1-5"  # 北京时间 9:28
+  # 2. 持仓分析（10:30，盘中调整建议）
+  - cron: "30 2 * * 1-5"  # 北京时间 10:30
+  # 3. 尾盘分析（14:50，尾盘买入前）
+  - cron: "50 6 * * 1-5"  # 北京时间 14:50
   # 手动触发（测试用）
   workflow_dispatch:
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # 加载Secrets + 设置北京时间
     env:
       TZ: Asia/Shanghai
-      FIXED_STOCK_LIST: ${{ secrets.FIXED_STOCK_LIST }}
+      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}  # 持仓/关注股票
     steps:
-      # 步骤1：检出代码
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      # 步骤2：设置Python环境
       - name: 配置Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      # 步骤3：安装依赖（仅需requests）
-      - name: 安装依赖包
+      - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install requests pandas
 
-      # 步骤4：执行实时选股+分版面分析
-      - name: 运行选股程序
+      - name: 运行三模块分析
         run: python main.py
 
-      # 步骤5：上传报告（保留30天）
-      - name: 上传分版面报告
+      - name: 上传报告
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: 东方财富选股报告-${{ github.run_number }}
+          name: 短线交易报告-${{ github.run_number }}
           path: reports/
           retention-days: 30
