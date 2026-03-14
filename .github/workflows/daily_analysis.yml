@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}  # 只留这个
+      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 安装依赖（必须包含 pandas）
+      - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install requests pandas
