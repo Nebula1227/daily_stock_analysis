@@ -1,143 +1,97 @@
 import os
-import tushare as ts
+import requests
 import pandas as pd
 from datetime import datetime
+import time
 
 # ====================== 1. 初始化配置 ======================
 # 设置时区为北京时间
 os.environ['TZ'] = 'Asia/Shanghai'
 try:
-    import time
     time.tzset()
 except:
     pass
 
-# 初始化Tushare（从环境变量获取token）
-ts_token = os.getenv('TUSHARE_TOKEN', '')
-if ts_token:
-    ts.set_token(ts_token)
-    pro = ts.pro_api()
-else:
-    print("⚠️ 未配置TUSHARE_TOKEN，选股功能将禁用")
-    pro = None
-
-# 获取固定股票列表（从环境变量）
+# 固定关注股票列表（从GitHub Secrets读取）
 FIXED_STOCK_LIST = os.getenv('FIXED_STOCK_LIST', '').split(',')
 FIXED_STOCK_LIST = [code.strip() for code in FIXED_STOCK_LIST if code.strip()]
 
-# ====================== 2. 短线选股函数 ======================
-def select_short_term_stocks():
-    """选股逻辑：MACD金叉 + 量能放大 + 股价站5日线（短线强势股）"""
-    if not pro:
-        return []
-    
+# ====================== 2. 东方财富实时行情接口（0成本） ======================
+def get_eastmoney_realtime(stock_code):
+    """
+    获取单只股票实时数据（延迟1-3分钟，完全免费）
+    :param stock_code: 股票代码，如 '600519'
+    :return: 实时数据字典 / None
+    """
+    # 代码格式转换：60开头→sh，00/30开头→sz
+    if stock_code.startswith('60'):
+        secid = f"1.{stock_code}"
+    elif stock_code.startswith('00') or stock_code.startswith('30'):
+        secid = f"0.{stock_code}"
+    else:
+        print(f"❌ {stock_code} 代码格式错误")
+        return None
+
+    try:
+        # 东方财富免费API（无调用限制）
+        url = f"http://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f44,f45,f46,f57,f60,f100"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()['data']
+
+        # 整理核心数据
+        realtime_data = {
+            'code': stock_code,
+            'name': data['f100'],          # 股票名称
+            'price': float(data['f43']),   # 最新价
+            'pre_close': float(data['f60']), # 昨收价
+            'high': float(data['f44']),    # 最高价
+            'low': float(data['f45']),     # 最低价
+            'volume': float(data['f46']),  # 成交量（手）
+            'pct_chg': round((float(data['f43']) - float(data['f60'])) / float(data['f60']) * 100, 2) # 涨跌幅
+        }
+        return realtime_data
+    except Exception as e:
+        print(f"❌ {stock_code} 实时数据获取失败：{str(e)[:50]}")
+        return None
+
+# ====================== 3. 实时选股逻辑（短线强势股） ======================
+def select_eastmoney_stocks():
+    """
+    选股条件（适配短线交易）：
+    1. 涨幅 0-5%（不追高）
+    2. 成交量 > 1万手（活跃度）
+    3. 股价 > 昨收价（上涨趋势）
+    4. 未到日内最高价（有上涨空间）
+    """
     selected_stocks = []
-    try:
-        # 获取A股基础列表（过滤ST/北交所/退市股）
-        stock_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name')
-        stock_basic = stock_basic[~stock_basic['name'].str.contains('ST|*ST', na=False)]
-        stock_basic = stock_basic[~stock_basic['ts_code'].str.endswith('BJ', na=False)]
-        
-        # 只筛选沪深主板/创业板/科创板（短线活跃）
-        valid_prefix = ['00', '30', '60', '68']
-        stock_basic = stock_basic[stock_basic['symbol'].str[:2].isin(valid_prefix)]
-        
-        # 取前200只候选（避免请求超限）
-        candidate_codes = stock_basic['ts_code'].tolist()[:200]
-        
-        # 时间范围（近20天）
-        today = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - pd.Timedelta(days=20)).strftime('%Y%m%d')
-        
-        for ts_code in candidate_codes:
-            try:
-                # 获取日线数据
-                df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=today)
-                if len(df) < 10:
-                    continue
-                
-                # 按日期排序（最新在前）
-                df = df.sort_values('trade_date', ascending=False)
-                
-                # 计算MACD
-                df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-                df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-                df['dif'] = df['ema12'] - df['ema26']
-                df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
-                
-                # 计算5日均线
-                df['ma5'] = df['close'].rolling(window=5).mean()
-                
-                # 最新数据
-                latest = df.iloc[0]
-                prev = df.iloc[1]
-                
-                # 选股条件（缺一不可）
-                macd_gold = (latest['dif'] > latest['dea']) and (prev['dif'] < prev['dea'])  # MACD金叉
-                vol_increase = latest['vol'] > prev['vol'] * 1.5  # 量能放大1.5倍
-                price_above_ma5 = latest['close'] > latest['ma5']  # 站5日线
-                valid_pct = -2 < latest['pct_chg'] < 5  # 涨跌幅合理
-                
-                if all([macd_gold, vol_increase, price_above_ma5, valid_pct]):
-                    # 获取股票名称
-                    stock_name = stock_basic[stock_basic['ts_code'] == ts_code]['name'].iloc[0]
-                    selected_stocks.append({
-                        'ts_code': ts_code,
-                        'symbol': stock_basic[stock_basic['ts_code'] == ts_code]['symbol'].iloc[0],
-                        'name': stock_name,
-                        'close': round(latest['close'], 2),
-                        'pct_chg': round(latest['pct_chg'], 2),
-                        'vol_ratio': round(latest['vol']/prev['vol'], 2)
-                    })
-            except Exception as e:
-                continue
-        
-        # 只返回前10只（精选短线标的）
-        return selected_stocks[:10]
-    except Exception as e:
-        print(f"❌ 选股失败：{str(e)}")
-        return []
+    # 短线活跃股票池（可自定义，替换成你关注的股票）
+    stock_pool = ['600519', '000858', '300750', '002594', '601012', '600036', '000333']
 
-# ====================== 3. 股票分析函数（适配你的原有逻辑） ======================
-def analyze_stock(stock_code):
-    """分析单只股票（基础版，可替换为你的完整分析逻辑）"""
-    if not pro:
-        return f"⚠️ {stock_code}：未配置Tushare，无法分析\n"
-    
-    try:
-        # 转换代码格式（600519 → 600519.SH，300750 → 300750.SZ）
-        ts_code = f"{stock_code}.SH" if stock_code.startswith('60') else f"{stock_code}.SZ"
-        
-        # 获取近10天数据
-        df = pro.daily(ts_code=ts_code, start_date=(datetime.now()-pd.Timedelta(days=10)).strftime('%Y%m%d'))
-        if len(df) == 0:
-            return f"⚠️ {stock_code}：无交易数据\n"
-        
-        latest = df.iloc[0]
-        stock_name = pro.stock_basic(ts_code=ts_code)['name'].iloc[0]
-        
-        # 基础分析（可替换为你的原有分析逻辑）
-        analysis = f"""
-【{stock_name}（{stock_code}）】
-最新价：{latest['close']} 元
-涨跌幅：{latest['pct_chg']}%
-成交量：{latest['vol']} 手
-5日均线：{round(df['ma5'].iloc[0], 2)} 元
-支撑位：{round(latest['low']*0.99, 2)} 元
-压力位：{round(latest['high']*1.01, 2)} 元
-短线建议：{'✅ 持仓' if latest['pct_chg'] > 0 else '⚠️ 观望'}
-"""
-        return analysis
-    except Exception as e:
-        return f"❌ {stock_code}：分析失败 - {str(e)[:50]}\n"
+    for code in stock_pool:
+        rt_data = get_eastmoney_realtime(code)
+        if not rt_data:
+            continue
 
-# ====================== 4. 生成分版面最终报告 ======================
+        # 筛选条件
+        cond1 = 0 < rt_data['pct_chg'] < 5          # 涨幅合理
+        cond2 = rt_data['volume'] > 10000           # 成交量活跃
+        cond3 = rt_data['price'] > rt_data['pre_close'] # 上涨趋势
+        cond4 = rt_data['price'] < rt_data['high'] * 0.98 # 未到高点
+
+        if all([cond1, cond2, cond3, cond4]):
+            selected_stocks.append(rt_data)
+
+    # 按涨幅排序，取前5只
+    selected_stocks = sorted(selected_stocks, key=lambda x: x['pct_chg'], reverse=True)[:5]
+    return selected_stocks
+
+# ====================== 4. 生成分版面报告（固定票+选股结果） ======================
 def generate_split_report():
-    """生成「固定股票+选股结果」分版面报告"""
+    """生成清晰的分版面报告"""
     # 报告头部
     report = f"""
 =====================================
-📅 股票分析报告（{datetime.now().strftime('%Y-%m-%d %H:%M')}）
+📅 东方财富实时选股报告（{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）
 =====================================
 
 【一、核心持仓分析（固定关注）】
@@ -145,42 +99,52 @@ def generate_split_report():
     # 分析固定股票
     if FIXED_STOCK_LIST:
         for code in FIXED_STOCK_LIST:
-            report += analyze_stock(code)
+            rt_data = get_eastmoney_realtime(code)
+            if rt_data:
+                report += f"""
+【{rt_data['name']}（{rt_data['code']}）】
+实时价：{rt_data['price']} 元 | 涨跌幅：{rt_data['pct_chg']}%
+成交量：{rt_data['volume']} 手
+支撑位：{round(rt_data['low'], 2)} 元 | 压力位：{round(rt_data['high'], 2)} 元
+短线建议：{'✅ 持有' if rt_data['pct_chg'] > 0 else '⚠️ 观望'}
+"""
+            else:
+                report += f"⚠️ {code}：无法获取实时数据\n"
     else:
         report += "⚠️ 未配置固定关注股票\n"
-    
-    # 分隔线 + 选股结果分析
+
+    # 分隔线 + 选股结果
     report += """
 -------------------------------------
-【二、今日短线标的分析（自动选股）】
+【二、今日实时短线标的（东方财富精选）】
 """
-    # 选股并分析
-    selected_stocks = select_short_term_stocks()
+    # 实时选股结果
+    selected_stocks = select_eastmoney_stocks()
     if selected_stocks:
-        for stock in selected_stocks:
+        for i, stock in enumerate(selected_stocks, 1):
+            stop_loss = round(stock['price'] * 0.97, 2)  # 3%止损
+            take_profit = round(stock['price'] * 1.05, 2) # 5%止盈
             report += f"""
-【{stock['name']}（{stock['symbol']}）】
-最新价：{stock['close']} 元
-涨跌幅：{stock['pct_chg']}%
-量能放大：{stock['vol_ratio']} 倍
-选股逻辑：MACD金叉 + 量能放大 + 站5日线
-短线操作：建议开盘关注，止损位{round(stock['close']*0.98, 2)}元
+【{i}. {stock['name']}（{stock['code']}）】
+实时价：{stock['price']} 元 | 涨跌幅：{stock['pct_chg']}%
+成交量：{stock['volume']} 手
+操作建议：回调至{round(stock['price']*0.99, 2)}元建仓，止损{stop_loss}元，止盈{take_profit}元
 """
     else:
-        report += "⚠️ 今日无符合条件的短线标的\n"
-    
+        report += "⚠️ 暂无符合条件的实时短线标的\n"
+
     # 保存报告到文件
     os.makedirs('reports', exist_ok=True)
-    report_path = f"reports/股票分析报告_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    report_path = f"reports/东方财富实时选股报告_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
-    
-    # 打印报告（方便日志查看）
+
+    # 打印报告（方便GitHub日志查看）
     print(report)
     return report
 
 # ====================== 5. 主函数（程序入口） ======================
 if __name__ == '__main__':
-    print("🚀 开始执行：选股 + 分版面分析")
+    print("🚀 开始执行：东方财富实时选股 + 分版面分析")
     final_report = generate_split_report()
     print("✅ 分版面报告已生成！")
