@@ -13,6 +13,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
+      WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}  # 新增这一行即可
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
