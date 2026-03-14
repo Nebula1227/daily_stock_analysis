@@ -1,13 +1,10 @@
 name: 短线交易三模块分析（早盘+持仓+尾盘）
 
 on:
-  # 1. 早盘分析（9:25-9:30，竞价结束后）
-  - cron: "28 1 * * 1-5"  # 北京时间 9:28
-  # 2. 持仓分析（10:30，盘中调整建议）
-  - cron: "30 2 * * 1-5"  # 北京时间 10:30
-  # 3. 尾盘分析（14:50，尾盘买入前）
-  - cron: "50 6 * * 1-5"  # 北京时间 14:50
-  # 手动触发（测试用）
+  schedule:
+    - cron: "28 1 * * 1-5"  # 早盘 9:28
+    - cron: "30 2 * * 1-5"  # 持仓 10:30
+    - cron: "50 6 * * 1-5"  # 尾盘 14:50
   workflow_dispatch:
 
 jobs:
@@ -15,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}  # 持仓/关注股票
+      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}  # 只留这个
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -26,7 +23,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 安装依赖
+      - name: 安装依赖（必须包含 pandas）
         run: |
           pip install --upgrade pip
           pip install requests pandas
