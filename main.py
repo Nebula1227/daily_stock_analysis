@@ -53,10 +53,50 @@ def is_trading_day():
     except:
         return datetime.now().weekday() < 5
 
-# ====================== 2. 全自动生成选股池（兜底池=你的持仓） ======================
+# ====================== 2. 微信推送核心函数（即时指令+完整报告） ======================
+def send_wechat_message(content, is_report=False):
+    """
+    发送微信消息（企业微信/微信群机器人）
+    :param content: 推送内容
+    :param is_report: 是否为完整报告（超长内容适配）
+    """
+    webhook_url = os.getenv('WECHAT_WEBHOOK_URL', '')
+    if not webhook_url:
+        print("⚠️ 未配置 WECHAT_WEBHOOK_URL，无法推送微信消息")
+        return
+
+    try:
+        # 完整报告超长，拆分推送（微信单条消息限2048字）
+        if is_report:
+            # 按分隔符拆分报告
+            parts = content.split('-------------------------------------')
+            # 先推送标题
+            send_wechat_message(parts[0].strip())
+            # 再推送各模块
+            for part in parts[1:]:
+                if part.strip():
+                    send_wechat_message(part.strip())
+            return
+        
+        # 普通即时消息
+        msg = {
+            "msgtype": "text",
+            "text": {
+                "content": content
+            }
+        }
+        resp = requests.post(webhook_url, json=msg, timeout=5)
+        if resp.status_code == 200 and resp.json().get('errcode') == 0:
+            print("✅ 微信消息推送成功")
+        else:
+            print(f"❌ 微信消息推送失败: {resp.text}")
+    except Exception as e:
+        print(f"❌ 微信推送异常: {str(e)}")
+
+# ====================== 3. 全自动生成选股池（兜底池=你的持仓） ======================
 def auto_generate_stock_pool():
     """
-    自动生成高活跃选股池：
+    自动生成高活跃选股池（缩到10只，提速核心）：
     - 筛选条件：换手率≥5%、成交量≥5万手、涨幅≥0、排除ST股
     - 兜底逻辑：自动池失败时，用你的持仓股票作为兜底
     """
@@ -72,8 +112,8 @@ def auto_generate_stock_pool():
         resp.raise_for_status()
         data = resp.json()['data']['diff']
         
-        # 提取前20只高活跃股票（排除ST股）
-        for stock in data[:20]:
+        # 提取前10只高活跃股票（排除ST股，缩池提速）
+        for stock in data[:10]:
             code = stock['f12']  # 股票代码
             name = stock['f14']  # 股票名称
             if 'ST' not in name and '*ST' not in name:
@@ -86,7 +126,7 @@ def auto_generate_stock_pool():
         print(f"⚠️ 自动生成选股池失败，使用持仓作为兜底池：{str(e)}")
         return HOLD_STOCK_LIST
 
-# ====================== 3. 基础配置 ======================
+# ====================== 4. 基础配置 ======================
 os.environ['TZ'] = 'Asia/Shanghai'
 try:
     time.tzset()
@@ -102,10 +142,10 @@ print("📌 你的持仓/关注股票：", HOLD_STOCK_LIST)
 latest_trading_day = get_latest_trading_day()
 print(f"📅 数据来源日期：{latest_trading_day}")
 
-# 自动生成选股池（核心：兜底=你的持仓）
+# 自动生成选股池（核心：兜底=你的持仓，缩到10只）
 STOCK_POOL = auto_generate_stock_pool()
 
-# ====================== 4. 东方财富API核心函数（防限流+高容错） ======================
+# ====================== 5. 东方财富API核心函数（防限流+高容错） ======================
 def get_eastmoney_data(stock_code, data_type="realtime"):
     """统一获取股票数据（实时/竞价/尾盘，非交易日取历史数据）"""
     # 代码格式转换
@@ -118,8 +158,8 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
         return None
 
     try:
-        # 防限流：每次请求等待0.2秒
-        time.sleep(0.2)
+        # 防限流：每次请求等待0.1秒（提速核心）
+        time.sleep(0.1)
         
         # 字段配置
         base_fields = "f43,f44,f45,f46,f57,f60,f100"  # 基础字段
@@ -192,9 +232,9 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
         print(f"❌ {stock_code} {data_type}数据获取失败: {str(e)[:60]}")
         return None
 
-# ====================== 5. 模块1：早盘分析（竞价买入，当日大涨） ======================
+# ====================== 6. 模块1：早盘分析（竞价买入，当日大涨 + 即时推送） ======================
 def morning_analysis():
-    """早盘选股：抓竞价强势、当日大涨不回落的票"""
+    """早盘选股：抓竞价强势、当日大涨不回落的票 + 即时微信推送"""
     morning_stocks = []
     for code in STOCK_POOL:
         try:
@@ -216,10 +256,26 @@ def morning_analysis():
             print(f"⚠️ 跳过早盘选股 {code}：{str(e)}")
             continue
 
+    # ========== 早盘即时结果 + 微信推送 ==========
+    print("\n🌅 【早盘即时选股结果】（竞价可买入）")
+    wechat_content = f"🌅 早盘即时选股结果（{latest_trading_day}）\n（竞价可买入，不破支撑位持有至大涨）\n"
+    if morning_stocks:
+        for i, stock in enumerate(morning_stocks[:3], 1):
+            line = f"{i}. {stock['name']}（{stock['code']}）\n  竞价高开：{stock['auction_pct']}% | 支撑位：{stock['support_price']}元 | 目标价：{stock['target_price']}元"
+            print(line)
+            wechat_content += line + "\n"
+    else:
+        wechat_content = f"🌅 早盘即时选股结果（{latest_trading_day}）\n⚠️ 暂无符合条件的早盘标的"
+        print(wechat_content)
+    
+    # 推送早盘即时指令到微信
+    send_wechat_message(wechat_content)
+    # ========== 推送结束 ==========
+
     # 按竞价量排序，取前3只
     return sorted(morning_stocks, key=lambda x: x['auction_vol'], reverse=True)[:3]
 
-# ====================== 6. 模块2：持仓/关注票操作建议 ======================
+# ====================== 7. 模块2：持仓/关注票操作建议 ======================
 def hold_analysis():
     """针对你的持仓，给出当日操作建议"""
     hold_suggestions = []
@@ -253,9 +309,9 @@ def hold_analysis():
             continue
     return hold_suggestions
 
-# ====================== 7. 模块3：尾盘分析（买入次日大涨/涨停） ======================
+# ====================== 8. 模块3：尾盘分析（买入次日大涨/涨停 + 即时推送） ======================
 def tail_analysis():
-    """尾盘选股：抓尾盘放量、次日大概率大涨/涨停的票"""
+    """尾盘选股：抓尾盘放量、次日大概率大涨/涨停的票 + 即时微信推送"""
     tail_stocks = []
     for code in STOCK_POOL:
         try:
@@ -277,12 +333,28 @@ def tail_analysis():
             print(f"⚠️ 跳过尾盘选股 {code}：{str(e)}")
             continue
 
+    # ========== 尾盘即时结果 + 微信推送 ==========
+    print("\n🔥 【尾盘即时选股结果】（可直接买入）")
+    wechat_content = f"🔥 尾盘即时选股结果（{latest_trading_day}）\n（尾盘买入，次日冲高止盈，目标涨停）\n"
+    if tail_stocks:
+        for i, stock in enumerate(tail_stocks[:3], 1):
+            line = f"{i}. {stock['name']}（{stock['code']}）\n  尾盘价：{stock['price']}元 | 买入价：{stock['buy_price']}元 | 次日目标：{stock['next_target']}元"
+            print(line)
+            wechat_content += line + "\n"
+    else:
+        wechat_content = f"🔥 尾盘即时选股结果（{latest_trading_day}）\n⚠️ 暂无符合条件的尾盘标的"
+        print(wechat_content)
+    
+    # 推送尾盘即时指令到微信
+    send_wechat_message(wechat_content)
+    # ========== 推送结束 ==========
+
     # 按换手率排序，取前3只
     return sorted(tail_stocks, key=lambda x: x['turnover'] if x['turnover'] else 0, reverse=True)[:3]
 
-# ====================== 8. 生成三模块完整报告 ======================
+# ====================== 9. 生成三模块完整报告 + 报告推送 ======================
 def generate_full_report():
-    """生成「早盘+持仓+尾盘」三模块分析报告"""
+    """生成「早盘+持仓+尾盘」三模块分析报告 + 微信推送完整报告"""
     now = datetime.now()
     report = f"""
 =====================================
@@ -347,10 +419,17 @@ def generate_full_report():
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report)
 
+    print("\n" + "="*50)
+    print("📋 完整分析报告已生成")
+    print("="*50)
     print(report)
+
+    # ========== 推送完整报告到微信 ==========
+    send_wechat_message(report, is_report=True)
+
     return report
 
-# ====================== 9. 主函数 ======================
+# ====================== 10. 主函数 ======================
 if __name__ == '__main__':
     print("🚀 开始执行：早盘+持仓+尾盘 三模块分析")
     generate_full_report()
