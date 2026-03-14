@@ -93,10 +93,10 @@ def send_wechat_message(content, is_report=False):
     except Exception as e:
         print(f"❌ 微信推送异常: {str(e)}")
 
-# ====================== 3. 全自动生成选股池（兜底池=你的持仓） ======================
+# ====================== 3. 全自动生成选股池（兜底池=你的持仓 + 防限流） ======================
 def auto_generate_stock_pool():
     """
-    自动生成高活跃选股池（缩到10只，提速核心）：
+    自动生成高活跃选股池（缩到8只，降低限流风险）：
     - 筛选条件：换手率≥5%、成交量≥5万手、涨幅≥0、排除ST股
     - 兜底逻辑：自动池失败时，用你的持仓股票作为兜底
     """
@@ -106,14 +106,16 @@ def auto_generate_stock_pool():
         return HOLD_STOCK_LIST  # 兜底：用持仓
     
     try:
+        # 降低请求频率，避免限流
+        time.sleep(0.5)
         # 东方财富高换手个股接口（自动筛选符合条件的股票）
         url = f"http://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=20&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426280e&fltt=2&invt=2&fid=f107&fs=m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14,f107,f5,f6,f8&f107=5&f5=0&f8=50000"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)  # 延长超时时间
         resp.raise_for_status()
         data = resp.json()['data']['diff']
         
-        # 提取前10只高活跃股票（排除ST股，缩池提速）
-        for stock in data[:10]:
+        # 提取前8只高活跃股票（进一步降低限流风险）
+        for stock in data[:8]:
             code = stock['f12']  # 股票代码
             name = stock['f14']  # 股票名称
             if 'ST' not in name and '*ST' not in name:
@@ -126,26 +128,36 @@ def auto_generate_stock_pool():
         print(f"⚠️ 自动生成选股池失败，使用持仓作为兜底池：{str(e)}")
         return HOLD_STOCK_LIST
 
-# ====================== 4. 基础配置 ======================
+# ====================== 4. 基础配置（过滤基金代码 + 防错） ======================
 os.environ['TZ'] = 'Asia/Shanghai'
 try:
     time.tzset()
 except:
     pass
 
-# 读取你的持仓/关注股票（从GitHub Secrets）
+# 读取你的持仓/关注股票（过滤基金代码，只保留60/00/30开头的A股）
 HOLD_STOCK_LIST = os.getenv('HOLD_STOCK_LIST', '').split(',')
-HOLD_STOCK_LIST = [code.strip() for code in HOLD_STOCK_LIST if code.strip()]
-print("📌 你的持仓/关注股票：", HOLD_STOCK_LIST)
+# 核心修复：过滤非A股代码 + 空值
+HOLD_STOCK_LIST = [
+    code.strip() for code in HOLD_STOCK_LIST 
+    if code.strip() and (code.startswith('60') or code.startswith('00') or code.startswith('30'))
+]
+print("📌 过滤后的持仓/关注股票（仅A股）：", HOLD_STOCK_LIST)
 
 # 获取最近交易日
 latest_trading_day = get_latest_trading_day()
 print(f"📅 数据来源日期：{latest_trading_day}")
 
-# 自动生成选股池（核心：兜底=你的持仓，缩到10只）
+# 自动生成选股池（核心：兜底=你的持仓，缩到8只）
 STOCK_POOL = auto_generate_stock_pool()
+# 最终过滤：确保选股池里只有A股代码
+STOCK_POOL = [
+    code for code in STOCK_POOL 
+    if code.startswith('60') or code.startswith('00') or code.startswith('30')
+]
+print(f"🔍 最终选股池（仅A股）：{STOCK_POOL}")
 
-# ====================== 5. 东方财富API核心函数（防限流+高容错） ======================
+# ====================== 5. 东方财富API核心函数（低延迟+高稳定） ======================
 def get_eastmoney_data(stock_code, data_type="realtime"):
     """统一获取股票数据（实时/竞价/尾盘，非交易日取历史数据）"""
     # 代码格式转换
@@ -154,12 +166,12 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
     elif stock_code.startswith('00') or stock_code.startswith('30'):
         secid = f"0.{stock_code}"
     else:
-        print(f"❌ {stock_code} 代码格式错误（非60/00/30开头）")
+        print(f"❌ {stock_code} 非A股代码，跳过")
         return None
 
     try:
-        # 防限流：每次请求等待0.1秒（提速核心）
-        time.sleep(0.1)
+        # 核心平衡：0.2秒sleep（既不慢，也不容易被限流）
+        time.sleep(0.2)
         
         # 字段配置
         base_fields = "f43,f44,f45,f46,f57,f60,f100"  # 基础字段
@@ -178,7 +190,7 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
         else:
             url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&klt=101&fqt=1&beg={latest_trading_day}&end={latest_trading_day}"
 
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)  # 延长超时时间，提高稳定性
         resp.raise_for_status()
         data = resp.json()['data']
 
@@ -194,30 +206,30 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
                 'volume': float(data['f46']),
                 'pct_chg': round((float(data['f43']) - float(data['f60'])) / float(data['f60']) * 100, 2)
             }
-            # 补充竞价字段
-            if data_type == "auction" and 'f84' in data:
-                result['auction_open'] = float(data['f43'])
-                result['auction_vol'] = float(data['f84'])
-                result['auction_pct'] = round((float(data['f43']) - float(data['f60'])) / float(data['f60']) * 100, 2)
-            # 补充尾盘字段
-            if data_type == "tail" and 'f107' in data:
-                result['turnover'] = float(data['f107'])
-                result['amount'] = float(data['f111']) / 10000
-                result['vol_ratio'] = float(data['f168'])
+            # 补充竞价字段（空值判断）
+            if data_type == "auction":
+                result['auction_open'] = float(data.get('f43', 0))
+                result['auction_vol'] = float(data.get('f84', 0))
+                result['auction_pct'] = round((float(data.get('f43', 0)) - float(data.get('f60', 0))) / float(data.get('f60', 1)), 2)
+            # 补充尾盘字段（空值判断）
+            if data_type == "tail":
+                result['turnover'] = float(data.get('f107', 0))
+                result['amount'] = float(data.get('f111', 0)) / 10000
+                result['vol_ratio'] = float(data.get('f168', 1.0))
         # 处理历史数据（周六/周日）
         else:
             if 'klines' in data and len(data['klines']) > 0:
                 kline = data['klines'][0].split(',')
                 result = {
                     'code': stock_code,
-                    'name': data['name'] if 'name' in data else stock_code,
+                    'name': data.get('name', stock_code),
                     'price': float(kline[4]),  # 收盘价
                     'pre_close': float(kline[2]),  # 昨收价
                     'high': float(kline[3]),  # 最高价
                     'low': float(kline[5]),  # 最低价
                     'volume': float(kline[8]),  # 成交量（手）
                     'pct_chg': round((float(kline[4]) - float(kline[2])) / float(kline[2]) * 100, 2),
-                    # 模拟竞价/尾盘字段
+                    # 模拟竞价/尾盘字段（空值兜底）
                     'auction_open': float(kline[1]),
                     'auction_vol': float(kline[8]) * 0.1,
                     'auction_pct': round((float(kline[1]) - float(kline[2])) / float(kline[2]) * 100, 2),
@@ -225,6 +237,7 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
                     'vol_ratio': 1.5
                 }
             else:
+                print(f"❌ {stock_code} 无历史数据，跳过")
                 return None
 
         return result
@@ -232,25 +245,30 @@ def get_eastmoney_data(stock_code, data_type="realtime"):
         print(f"❌ {stock_code} {data_type}数据获取失败: {str(e)[:60]}")
         return None
 
-# ====================== 6. 模块1：早盘分析（竞价买入，当日大涨 + 即时推送） ======================
+# ====================== 6. 模块1：早盘分析（竞价买入 + 即时推送 + 空值防错） ======================
 def morning_analysis():
     """早盘选股：抓竞价强势、当日大涨不回落的票 + 即时微信推送"""
     morning_stocks = []
+    if not STOCK_POOL:
+        print("⚠️ 选股池为空，跳过早盘分析")
+        send_wechat_message(f"🌅 早盘即时选股结果（{latest_trading_day}）\n⚠️ 选股池为空，无分析数据")
+        return []
+
     for code in STOCK_POOL:
         try:
             auc_data = get_eastmoney_data(code, "auction")
             if not auc_data:
-                continue
+                continue  # 核心修复：空值直接跳过
 
-            # 选股条件（强势不极端，避免追高）
-            cond1 = 3 < auc_data['auction_pct'] < 8          # 竞价高开3%-8%
-            cond2 = auc_data['auction_vol'] > 5000           # 竞价量≥5000手
-            cond3 = auc_data['price'] > auc_data['auction_open'] * 0.99  # 不破开盘价
-            cond4 = auc_data['volume'] > auc_data['auction_vol'] * 1.2   # 开盘放量
+            # 选股条件（空值兜底，避免报错）
+            cond1 = 3 < auc_data.get('auction_pct', 0) < 8          # 竞价高开3%-8%
+            cond2 = auc_data.get('auction_vol', 0) > 5000           # 竞价量≥5000手
+            cond3 = auc_data.get('price', 0) > auc_data.get('auction_open', 0) * 0.99  # 不破开盘价
+            cond4 = auc_data.get('volume', 0) > auc_data.get('auction_vol', 0) * 1.2   # 开盘放量
 
             if all([cond1, cond2, cond3, cond4]):
-                auc_data['target_price'] = round(auc_data['pre_close'] * 1.1, 2)  # 当日目标价（涨停）
-                auc_data['support_price'] = round(auc_data['auction_open'] * 0.98, 2)  # 支撑位
+                auc_data['target_price'] = round(auc_data.get('pre_close', 0) * 1.1, 2)  # 当日目标价（涨停）
+                auc_data['support_price'] = round(auc_data.get('auction_open', 0) * 0.98, 2)  # 支撑位
                 morning_stocks.append(auc_data)
         except Exception as e:
             print(f"⚠️ 跳过早盘选股 {code}：{str(e)}")
@@ -273,31 +291,36 @@ def morning_analysis():
     # ========== 推送结束 ==========
 
     # 按竞价量排序，取前3只
-    return sorted(morning_stocks, key=lambda x: x['auction_vol'], reverse=True)[:3]
+    return sorted(morning_stocks, key=lambda x: x.get('auction_vol', 0), reverse=True)[:3]
 
-# ====================== 7. 模块2：持仓/关注票操作建议 ======================
+# ====================== 7. 模块2：持仓/关注票操作建议（空值防错） ======================
 def hold_analysis():
     """针对你的持仓，给出当日操作建议"""
     hold_suggestions = []
+    if not HOLD_STOCK_LIST:
+        print("⚠️ 持仓列表为空，跳过持仓分析")
+        return []
+
     for code in HOLD_STOCK_LIST:
         try:
             rt_data = get_eastmoney_data(code, "realtime")
             if not rt_data:
-                continue
+                continue  # 核心修复：空值直接跳过
 
-            # 趋势判断 + 操作建议
-            if rt_data['pct_chg'] > 3:
+            # 趋势判断 + 操作建议（空值兜底）
+            pct_chg = rt_data.get('pct_chg', 0)
+            if pct_chg > 3:
                 trend = "强势上涨"
                 suggestion = "✅ 持有，不破5日线不卖"
-            elif 0 < rt_data['pct_chg'] <= 3:
+            elif 0 < pct_chg <= 3:
                 trend = "震荡上涨"
                 suggestion = "✅ 持有，可小仓位加仓"
-            elif -3 < rt_data['pct_chg'] <= 0:
+            elif -3 < pct_chg <= 0:
                 trend = "震荡调整"
                 suggestion = "⚠️ 观望，做T（高抛低吸）"
             else:
                 trend = "弱势下跌"
-                suggestion = "❌ 减仓，止损位：" + str(round(rt_data['pre_close'] * 0.97, 2))
+                suggestion = "❌ 减仓，止损位：" + str(round(rt_data.get('pre_close', 0) * 0.97, 2))
 
             hold_suggestions.append({
                 **rt_data,
@@ -309,25 +332,30 @@ def hold_analysis():
             continue
     return hold_suggestions
 
-# ====================== 8. 模块3：尾盘分析（买入次日大涨/涨停 + 即时推送） ======================
+# ====================== 8. 模块3：尾盘分析（买入次日大涨 + 即时推送 + 空值防错） ======================
 def tail_analysis():
     """尾盘选股：抓尾盘放量、次日大概率大涨/涨停的票 + 即时微信推送"""
     tail_stocks = []
+    if not STOCK_POOL:
+        print("⚠️ 选股池为空，跳过尾盘分析")
+        send_wechat_message(f"🔥 尾盘即时选股结果（{latest_trading_day}）\n⚠️ 选股池为空，无分析数据")
+        return []
+
     for code in STOCK_POOL:
         try:
             tail_data = get_eastmoney_data(code, "tail")
             if not tail_data:
-                continue
+                continue  # 核心修复：空值直接跳过
 
-            # 选股条件（低风险，高性价比）
-            cond1 = 1 < tail_data['pct_chg'] < 5             # 尾盘涨幅1%-5%
-            cond2 = 5 < tail_data['turnover'] < 15 if tail_data['turnover'] else True  # 换手率5%-15%
-            cond3 = tail_data['vol_ratio'] >= 1.5 if tail_data['vol_ratio'] else True  # 量比≥1.5
-            cond4 = tail_data['price'] > tail_data['high'] * 0.98  # 收盘价靠近最高价
+            # 选股条件（空值兜底，避免报错）
+            cond1 = 1 < tail_data.get('pct_chg', 0) < 5             # 尾盘涨幅1%-5%
+            cond2 = 5 < tail_data.get('turnover', 0) < 15           # 换手率5%-15%
+            cond3 = tail_data.get('vol_ratio', 0) >= 1.5            # 量比≥1.5
+            cond4 = tail_data.get('price', 0) > tail_data.get('high', 0) * 0.98  # 收盘价靠近最高价
 
             if all([cond1, cond2, cond3, cond4]):
-                tail_data['next_target'] = round(tail_data['pre_close'] * 1.1, 2)  # 次日目标价（涨停）
-                tail_data['buy_price'] = round(tail_data['price'] * 1.01, 2)  # 尾盘买入价
+                tail_data['next_target'] = round(tail_data.get('pre_close', 0) * 1.1, 2)  # 次日目标价（涨停）
+                tail_data['buy_price'] = round(tail_data.get('price', 0) * 1.01, 2)  # 尾盘买入价
                 tail_stocks.append(tail_data)
         except Exception as e:
             print(f"⚠️ 跳过尾盘选股 {code}：{str(e)}")
@@ -350,7 +378,7 @@ def tail_analysis():
     # ========== 推送结束 ==========
 
     # 按换手率排序，取前3只
-    return sorted(tail_stocks, key=lambda x: x['turnover'] if x['turnover'] else 0, reverse=True)[:3]
+    return sorted(tail_stocks, key=lambda x: x.get('turnover', 0), reverse=True)[:3]
 
 # ====================== 9. 生成三模块完整报告 + 报告推送 ======================
 def generate_full_report():
