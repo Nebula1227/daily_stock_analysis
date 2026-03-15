@@ -404,7 +404,7 @@ def monitor_aggr():
 # ====================== 主函数 ======================
 if __name__ == "__main__":
     # 启动通知
-    send_wechat("✅ 终极版监控系统（第三方Tushare）已启动\n积分节流模式：每日消耗≤1500积分\n7天10000积分完全够用！")
+    send_wechat("✅ 巴菲赖您好，您的助手已成功启动")
     
     # 启动线程
     threading.Thread(target=monitor_auction, daemon=True).start()
