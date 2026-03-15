@@ -5,11 +5,15 @@ from datetime import datetime, timedelta
 import time
 import tushare as ts
 
-# ====================== 初始化 Tushare ======================
-ts.set_token(os.getenv('TUSHARE_TOKEN', ''))
-pro = ts.pro_api()
+# ====================== 初始化 第三方 Tushare 镜像 ======================
+# 替换为你购买的token（卖家提供的字符串）
+TU_SHARE_TOKEN = "b5ee7872baf9656580c59705285e4d570a0dc2a35f0ecfa67ec3b0438cbb"
+pro = ts.pro_api(TU_SHARE_TOKEN)
+# 第三方接口必须配置的地址和token参数
+pro._DataApi__token = TU_SHARE_TOKEN
+pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
 
-# ====================== 1. 核心工具函数：交易日处理（改用 Tushare） ======================
+# ====================== 1. 核心工具函数：交易日处理（改用第三方Tushare） ======================
 def get_latest_trading_day(target_date=None):
     """获取最近交易日（周六/周日返回周五，节假日返回节前最后一个交易日）"""
     if target_date is None:
@@ -17,7 +21,7 @@ def get_latest_trading_day(target_date=None):
     
     target_str = target_date.strftime('%Y%m%d')
     try:
-        # 用 Tushare 交易日接口判断
+        # 用第三方Tushare交易日接口判断
         df = pro.trade_cal(exchange='SSE', start_date=target_str, end_date=target_str)
         if not df.empty and df.iloc[0]['is_open'] == 1:
             return target_str
@@ -39,7 +43,7 @@ def get_latest_trading_day(target_date=None):
             return target_str
 
 def is_trading_day():
-    """判断当天是否是A股交易日（改用 Tushare）"""
+    """判断当天是否是A股交易日（改用第三方Tushare）"""
     today = datetime.now().strftime('%Y%m%d')
     try:
         df = pro.trade_cal(exchange='SSE', start_date=today, end_date=today)
@@ -106,7 +110,7 @@ def send_wechat_message(content, is_report=False):
     except Exception as e:
         print(f"❌ 微信推送异常: {str(e)}")
 
-# ====================== 4. 自动选股池（改用 Tushare） ======================
+# ====================== 4. 自动选股池（改用第三方Tushare） ======================
 def auto_generate_stock_pool():
     """
     自动生成5只高活跃选股池（兜底用）
@@ -118,7 +122,7 @@ def auto_generate_stock_pool():
         return []
     
     try:
-        # 用 Tushare 取高换手个股（前10只，取前5只非ST）
+        # 用第三方Tushare取高换手个股（前10只，取前5只非ST）
         time.sleep(0.5)
         df = pro.daily_basic(
             trade_date=latest_day,
@@ -186,15 +190,15 @@ if not STOCK_POOL:
     exit(0)
 print(f"🔍 最终选股池（自选+自动）：{STOCK_POOL}")
 
-# ====================== 6. Tushare 数据获取（替换东方财富API） ======================
+# ====================== 6. 第三方Tushare 数据获取（替换东方财富API） ======================
 def get_tushare_data(stock_code, data_type="realtime"):
     """
-    获取股票数据（Tushare 版本）
+    获取股票数据（第三方Tushare版本）
     :param stock_code: 股票代码（纯数字）
     :param data_type: realtime/auction/tail
     :return: 数据字典/None
     """
-    # 代码格式转换：纯数字 → Tushare 格式
+    # 代码格式转换：纯数字 → Tushare格式
     if stock_code.startswith('60'):
         ts_code = f"{stock_code}.SH"
     elif stock_code.startswith('00') or stock_code.startswith('30'):
