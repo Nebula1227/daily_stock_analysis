@@ -1,40 +1,45 @@
-name: 短线交易三模块分析（早盘+持仓+尾盘）
+name: Daily Stock Analysis
 
 on:
+  # 定时触发（早盘9:27、尾盘14:52，覆盖全场景分析）
   schedule:
-    - cron: "27 1 * * 1-5"   # 早盘 9:27 触发
-    - cron: "30 2 * * 1-5"   # 持仓 10:30 不变
-    - cron: "52 14 * * 1-5"  # 尾盘 14:52 触发
+    - cron: '27 1 * * 1-5'  # 北京时间9:27 → 执行早盘+持仓分析
+    - cron: '52 6 * * 1-5'  # 北京时间14:52 → 执行尾盘+持仓分析
+  # 手动触发（可随时执行全量分析）
   workflow_dispatch:
 
 jobs:
-  analyze:
+  stock-analysis-job:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
       HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
-      WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}  # 新增这一行即可
+      WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+
     steps:
-      - name: 检出代码
+      - name: 1. 拉取代码仓库
         uses: actions/checkout@v4
 
-      - name: 配置Python
+      - name: 2. 配置Python环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 安装依赖
+      - name: 3. 安装依赖（含Tushare）
         run: |
           pip install --upgrade pip
-          pip install requests pandas
+          pip install requests pandas tushare
 
-      - name: 运行三模块分析
-        run: python main.py
+      - name: 4. 执行核心分析（含早盘+持仓+尾盘）
+        run: |
+          echo "开始执行：早盘分析 → 持仓分析 → 尾盘分析"
+          python main.py  # 这一步会完整运行所有分析逻辑
 
-      - name: 上传报告
+      - name: 5. 上传分析报告（含持仓分析结果）
         uses: actions/upload-artifact@v4
         with:
-          name: 短线交易报告-${{ github.run_number }}
+          name: stock-analysis-report
           path: reports/
-          retention-days: 30
+          retention-days: 7
