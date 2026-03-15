@@ -1,40 +1,42 @@
-name: Double-Strategy-Stock-Monitor
+name: Stock Monitor (Third-Party Tushare)
 
 on:
+  workflow_dispatch:
+  # 周一到周五 9:20 自动启动（UTC+8 → GitHub UTC 时区是 1:20）
   schedule:
     - cron: '20 1 * * 1-5'
-  workflow_dispatch:
 
 jobs:
-  stock-monitor-job:
+  run-monitor:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Shanghai
-      HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
-      WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-
     steps:
-      - name: 1. 拉取代码仓库
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 2. 配置Python环境
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
+          python-version: '3.10'  # 兼容第三方 Tushare 最佳版本
 
-      - name: 3. 安装依赖
+      # 安装依赖（仅安装基础库，不覆盖第三方 Tushare）
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          pip install requests pandas  # 只装基础库，不装官方 tushare
+          pip install python-dotenv
 
-      - name: 4. 启动整合版监控（包含稳健+激进+早晚盘+持仓分析）
-        run: python main.py
+      # 配置敏感信息（推荐用 GitHub Secrets）
+      - name: Set environment variables
+        env:
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
+        run: |
+          echo "WECHAT_WEBHOOK_URL=$WECHAT_WEBHOOK_URL" >> $GITHUB_ENV
+          echo "TUSHARE_TOKEN=$TUSHARE_TOKEN" >> $GITHUB_ENV
+          echo "HOLD_STOCK_LIST=$HOLD_STOCK_LIST" >> $GITHUB_ENV
 
-      - name: 5. 上传运行日志
-        uses: actions/upload-artifact@v4
-        with:
-          name: stock-monitor-logs
-          path: |
-            *.log
-          retention-days: 7
+      # 运行监控程序（8小时超时，避免资源浪费）
+      - name: Run stock monitor
+        run: |
+          python main.py
+          sleep 28800
