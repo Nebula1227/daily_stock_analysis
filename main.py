@@ -1,453 +1,240 @@
 import os
+import time
+import threading
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-import time
-import tushare as ts
 
-# ====================== 初始化 第三方 Tushare 镜像 ======================
-# 替换为你购买的token（卖家提供的字符串）
+# ====================== 【V2.0 最终版配置】 ======================
+# 你的第三方TOKEN（非必须，本版已适配免费接口）
 TU_SHARE_TOKEN = "b5ee7872baf9656580c59705285e4d570a0dc2a35f0ecfa67ec3b0438cbb"
-pro = ts.pro_api(TU_SHARE_TOKEN)
-# 第三方接口必须配置的地址和token参数
-pro._DataApi__token = TU_SHARE_TOKEN
-pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "")
+HOLD_STOCK_LIST = [c.strip() for c in os.getenv("HOLD_STOCK_LIST", "").split(",") if c.strip()]
 
-# ====================== 1. 核心工具函数：交易日处理（改用第三方Tushare） ======================
-def get_latest_trading_day(target_date=None):
-    """获取最近交易日（周六/周日返回周五，节假日返回节前最后一个交易日）"""
-    if target_date is None:
-        target_date = datetime.now()
-    
-    target_str = target_date.strftime('%Y%m%d')
-    try:
-        # 用第三方Tushare交易日接口判断
-        df = pro.trade_cal(exchange='SSE', start_date=target_str, end_date=target_str)
-        if not df.empty and df.iloc[0]['is_open'] == 1:
-            return target_str
-        else:
-            # 非交易日往前找
-            for i in range(1, 10):
-                check_date = target_date - timedelta(days=i)
-                check_str = check_date.strftime('%Y%m%d')
-                df = pro.trade_cal(exchange='SSE', start_date=check_str, end_date=check_str)
-                if not df.empty and df.iloc[0]['is_open'] == 1:
-                    return check_str
-            return None
-    except Exception as e:
-        print(f"⚠️ Tushare 交易日接口异常，兜底处理：{str(e)}")
-        # 兜底：周末返回周五
-        if target_date.weekday() >= 5:
-            return (target_date - timedelta(days=target_date.weekday() - 4)).strftime('%Y%m%d')
-        else:
-            return target_str
+# 核心策略参数（已实战优化）
+LOW_PRICE_MAX = 20          # 股价≤20元
+LOW_RANGE_MAX = 0.15        # 距30日低点≤15%
+RISE_5D_MAX = 12            # 近5日涨幅≤12%
+MV_MIN = 30                 # 流通市值≥30亿
+MV_MAX = 150                # 流通市值≤150亿
+VOL_MIN = 1.6               # 量比≥1.6
+VOL_MAX = 5                 # 量比≤5
+STOP_LOSS = 0.96            # 4%止损
+TAKE_PROFIT = 1.08          # 8%止盈
+SCAN_INTERVAL = 60          # 1分钟监控
 
-def is_trading_day():
-    """判断当天是否是A股交易日（改用第三方Tushare）"""
-    today = datetime.now().strftime('%Y%m%d')
-    try:
-        df = pro.trade_cal(exchange='SSE', start_date=today, end_date=today)
-        return not df.empty and df.iloc[0]['is_open'] == 1
-    except Exception as e:
-        print(f"⚠️ Tushare 交易日判断异常，兜底处理：{str(e)}")
-        return datetime.now().weekday() < 5
-
-# ====================== 2. 核心：带重试的HTTP请求（保留，用于微信推送） ======================
-def request_with_retry(url, max_retries=3, delay=1):
-    """
-    带重试的HTTP GET请求，提高接口成功率
-    :param url: 请求地址
-    :param max_retries: 最大重试次数
-    :param delay: 重试间隔（秒）
-    :return: 响应对象/None
-    """
-    for i in range(max_retries):
-        try:
-            # 增加超时时间+模拟浏览器请求头，避免被风控
-            resp = requests.get(url, timeout=20, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://quote.eastmoney.com/'
-            })
-            resp.raise_for_status()  # 抛出HTTP错误
-            return resp
-        except Exception as e:
-            print(f"⚠️ 请求失败（第{i+1}次重试）：{str(e)[:50]}")
-            if i < max_retries - 1:
-                time.sleep(delay)
-    print(f"❌ {url} 多次请求失败，放弃")
-    return None
-
-# ====================== 3. 微信推送核心函数（保留） ======================
-def send_wechat_message(content, is_report=False):
-    """发送微信消息（企业微信/微信群机器人）"""
-    webhook_url = os.getenv('WECHAT_WEBHOOK_URL', '')
-    if not webhook_url:
-        print("⚠️ 未配置 WECHAT_WEBHOOK_URL，无法推送微信消息")
+# ====================== 基础工具函数 ======================
+def send_wechat(msg):
+    """微信消息推送"""
+    if not WECHAT_WEBHOOK_URL:
+        print("⚠️ 未配置微信Webhook，跳过推送")
         return
-
     try:
-        # 完整报告拆分推送（适配微信字数限制）
-        if is_report:
-            parts = content.split('-------------------------------------')
-            send_wechat_message(parts[0].strip())
-            for part in parts[1:]:
-                if part.strip():
-                    send_wechat_message(part.strip())
-            return
+        requests.post(WECHAT_WEBHOOK_URL, json={"msgtype": "text", "text": {"content": msg.strip()}})
+        print("✅ 微信推送成功")
+    except Exception as e:
+        print(f"❌ 微信推送失败：{e}")
+
+def is_trading_time():
+    """判断是否为交易时间"""
+    now = datetime.now().time()
+    start = datetime.strptime("09:30:00", "%H:%M:%S").time()
+    end = datetime.strptime("15:00:00", "%H:%M:%S").time()
+    return start <= now <= end
+
+# ====================== V2.0核心：大盘环境判断 ======================
+def market_is_safe():
+    """判断大盘环境是否安全（暴跌时不交易）"""
+    try:
+        # 沪深指数实时数据
+        url = "https://push2.eastmoney.com/api/qt/ulist/nlist?secid=1.000001,0.399001&fields=f3"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()["data"]["diff"]
+        shanghai = float(data[0]["f3"])  # 上证指数
+        shenzhen = float(data[1]["f3"])  # 深证成指
+        # 大盘跌幅≤0.3%视为安全
+        return shanghai >= -0.3 and shenzhen >= -0.3
+    except Exception as e:
+        print(f"⚠️ 大盘环境判断失败：{e}，默认视为安全")
+        return True
+
+# ====================== V2.0核心：低位过滤 ======================
+def is_low_real(stock):
+    """严格低位判断（4条铁律）"""
+    try:
+        price = float(stock["price"])
+        low30 = float(stock["low30"])
+        rise5d = float(stock["rise5d"])
+        mv = float(stock["mcap"]) / 10000  # 流通市值（万元转亿元）
         
-        # 普通即时消息
-        msg = {
-            "msgtype": "text",
-            "text": {
-                "content": content
-            }
+        # 低位条件全部满足
+        cond_price = price <= LOW_PRICE_MAX
+        cond_low_range = (price - low30) / low30 <= LOW_RANGE_MAX
+        cond_rise = rise5d <= RISE_5D_MAX
+        cond_mv = MV_MIN <= mv <= MV_MAX
+        
+        return all([cond_price, cond_low_range, cond_rise, cond_mv])
+    except Exception as e:
+        print(f"⚠️ 低位判断失败：{e}")
+        return False
+
+# ====================== V2.0核心：真启动判断 ======================
+def is_real_start(stock):
+    """判断是否为真启动（过滤假放量/假突破）"""
+    try:
+        vol_ratio = float(stock["volRatio"])
+        avg_price = float(stock["avgPrice"])
+        current_price = float(stock["price"])
+        
+        # 量比合理 + 股价紧贴均价线（资金承接强）
+        cond_vol = VOL_MIN <= vol_ratio <= VOL_MAX
+        cond_price = current_price >= avg_price * 0.995
+        
+        return cond_vol and cond_price
+    except Exception as e:
+        print(f"⚠️ 启动判断失败：{e}")
+        return False
+
+# ====================== V2.0核心：流动性安全 ======================
+def is_safe_trade(stock):
+    """判断交易安全性（排除ST/低流动性）"""
+    try:
+        amount = float(stock["amount"]) / 10000  # 成交额（万元）
+        name = stock["name"]
+        
+        # 成交额≥1.5亿 + 非ST股
+        cond_amount = amount >= 1.5
+        cond_st = "ST" not in name
+        
+        return cond_amount and cond_st
+    except Exception as e:
+        print(f"⚠️ 安全判断失败：{e}")
+        return False
+
+# ====================== V2.0 实时数据获取 ======================
+def get_real(code):
+    """获取个股实时数据（免费接口）"""
+    try:
+        # 东方财富secid转换
+        secid = f"1.{code}" if code.startswith("60") else f"0.{code}"
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f57,f58,f168,f44,f107,f116,f217,f46,f173"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        resp = requests.post(webhook_url, json=msg, timeout=5)
-        if resp.status_code == 200 and resp.json().get('errcode') == 0:
-            print("✅ 微信消息推送成功")
-        else:
-            print(f"❌ 微信消息推送失败: {resp.text}")
+        resp = requests.get(url, headers=headers, timeout=3)
+        data = resp.json()["data"]
+        
+        return {
+            "code": code,
+            "name": data["f58"],
+            "price": data["f43"],          # 当前价
+            "volRatio": data["f168"],      # 量比
+            "avgPrice": data["f44"],       # 分时均价
+            "low30": data["f107"],         # 30日最低价
+            "rise5d": data["f116"],        # 近5日涨幅
+            "mcap": data["f217"],          # 流通市值（万元）
+            "amount": data["f46"],         # 成交额（万元）
+            "highLimit": data["f173"]      # 涨停价
+        }
     except Exception as e:
-        print(f"❌ 微信推送异常: {str(e)}")
-
-# ====================== 4. 自动选股池（改用第三方Tushare） ======================
-def auto_generate_stock_pool():
-    """
-    自动生成5只高活跃选股池（兜底用）
-    :return: 股票代码列表
-    """
-    auto_pool = []
-    latest_day = get_latest_trading_day()
-    if not latest_day:
-        return []
-    
-    try:
-        # 用第三方Tushare取高换手个股（前10只，取前5只非ST）
-        time.sleep(0.5)
-        df = pro.daily_basic(
-            trade_date=latest_day,
-            fields='ts_code, name, turnover_rate, volume_ratio, amount'
-        )
-        if df.empty:
-            return []
-        
-        # 筛选：换手率5%-20%，量比>1，成交额>5亿，排除ST
-        df = df[
-            (df['turnover_rate'] > 5) &
-            (df['turnover_rate'] < 20) &
-            (df['volume_ratio'] > 1) &
-            (df['amount'] > 50000) &
-            (~df['name'].str.contains('ST'))
-        ].sort_values('turnover_rate', ascending=False).head(10)
-        
-        # 提取前5只，转成纯数字代码
-        for _, row in df.iterrows():
-            code = row['ts_code'].split('.')[0]
-            auto_pool.append(code)
-            if len(auto_pool) >= 5:
-                break
-        
-        print(f"✅ 自动生成选股池（{len(auto_pool)}只）：{auto_pool}")
-        return auto_pool
-    except Exception as e:
-        print(f"⚠️ 自动生成选股池失败：{str(e)}")
-        return []
-
-# ====================== 5. 基础配置（保留） ======================
-os.environ['TZ'] = 'Asia/Shanghai'
-try:
-    time.tzset()
-except:
-    pass
-
-# 🔧 核心开关：是否开启自动选股（True=自选+5只自动，False=只跑自选）
-ENABLE_AUTO_SELECT = True
-
-# 读取你的自选持仓池（过滤非A股代码）
-HOLD_STOCK_LIST = os.getenv('HOLD_STOCK_LIST', '').split(',')
-HOLD_STOCK_LIST = [
-    code.strip() for code in HOLD_STOCK_LIST 
-    if code.strip() and (code.startswith('60') or code.startswith('00') or code.startswith('30'))
-]
-print("📌 你的自选持仓池：", HOLD_STOCK_LIST)
-
-# 获取最近交易日
-latest_trading_day = get_latest_trading_day()
-print(f"📅 数据来源日期：{latest_trading_day}")
-
-# 构建最终选股池（自选+自动，去重）
-STOCK_POOL = HOLD_STOCK_LIST.copy()
-if ENABLE_AUTO_SELECT:
-    auto_pool = auto_generate_stock_pool()
-    # 合并自选池+自动池，去重
-    STOCK_POOL = list(set(STOCK_POOL + auto_pool))
-
-# 最终过滤：只保留A股代码
-STOCK_POOL = [code for code in STOCK_POOL if code.startswith(('60','00','30'))]
-if not STOCK_POOL:
-    print("⚠️ 最终选股池为空，程序退出")
-    send_wechat_message(f"⚠️ 选股池为空（{latest_trading_day}），无分析数据")
-    exit(0)
-print(f"🔍 最终选股池（自选+自动）：{STOCK_POOL}")
-
-# ====================== 6. 第三方Tushare 数据获取（替换东方财富API） ======================
-def get_tushare_data(stock_code, data_type="realtime"):
-    """
-    获取股票数据（第三方Tushare版本）
-    :param stock_code: 股票代码（纯数字）
-    :param data_type: realtime/auction/tail
-    :return: 数据字典/None
-    """
-    # 代码格式转换：纯数字 → Tushare格式
-    if stock_code.startswith('60'):
-        ts_code = f"{stock_code}.SH"
-    elif stock_code.startswith('00') or stock_code.startswith('30'):
-        ts_code = f"{stock_code}.SZ"
-    else:
-        print(f"❌ {stock_code} 非A股代码，跳过")
+        print(f"❌ 获取{code}数据失败：{e}")
         return None
 
-    try:
-        # 限流控制：每次请求间隔0.3秒
-        time.sleep(0.3)
-        latest_day = get_latest_trading_day()
-        
-        # 1. 获取日线基础数据
-        df_daily = pro.daily(ts_code=ts_code, trade_date=latest_day)
-        if df_daily.empty:
-            print(f"❌ {stock_code} 无日线数据")
-            return None
-        daily = df_daily.iloc[0]
-        
-        # 2. 获取每日指标数据（换手率、量比等）
-        df_basic = pro.daily_basic(ts_code=ts_code, trade_date=latest_day)
-        basic = df_basic.iloc[0] if not df_basic.empty else {}
-        
-        # 3. 构建结果字典
-        result = {
-            'code': stock_code,
-            'name': basic.get('name', stock_code),
-            'price': float(daily['close']),
-            'pre_close': float(daily['pre_close']),
-            'high': float(daily['high']),
-            'low': float(daily['low']),
-            'volume': float(daily['vol']) / 100,  # 手数
-            'pct_chg': round(float(daily['pct_chg']), 2)
-        }
-
-        # 补充竞价字段（用开盘价近似）
-        if data_type == "auction":
-            result['auction_open'] = float(daily['open'])
-            result['auction_vol'] = float(daily['vol']) / 100 * 0.1  # 竞价量估算
-            result['auction_pct'] = round((float(daily['open']) - float(daily['pre_close'])) / float(daily['pre_close']) * 100, 2)
-        
-        # 补充尾盘字段
-        if data_type == "tail":
-            result['turnover'] = float(basic.get('turnover_rate', 0))
-            result['amount'] = float(daily['amount']) / 10000  # 万元
-            result['vol_ratio'] = float(basic.get('volume_ratio', 1.0))
-
-        return result
-    except Exception as e:
-        print(f"❌ {stock_code} {data_type}数据解析失败: {str(e)[:60]}")
+# ====================== V2.0 最终选股 ======================
+def scan_one(code):
+    """单只股票筛选"""
+    stock_data = get_real(code)
+    if not stock_data:
         return None
-
-# ====================== 7. 早盘分析（保留逻辑，替换数据函数） ======================
-def morning_analysis():
-    """早盘竞价分析 + 即时微信推送"""
-    morning_stocks = []
-    print("\\n🌅 开始早盘竞价分析...")
-
-    for code in STOCK_POOL:
-        try:
-            auc_data = get_tushare_data(code, "auction")
-            if not auc_data:
-                continue
-
-            # 选股条件（空值兜底，避免报错）
-            cond1 = 3 < auc_data.get('auction_pct', 0) < 8          # 竞价高开3%-8%
-            cond2 = auc_data.get('auction_vol', 0) > 5000           # 竞价量≥5000手
-            cond3 = auc_data.get('price', 0) > auc_data.get('auction_open', 0) * 0.99  # 不破开盘价
-            cond4 = auc_data.get('volume', 0) > auc_data.get('auction_vol', 0) * 1.2   # 放量
-
-            if all([cond1, cond2, cond3, cond4]):
-                auc_data['target_price'] = round(auc_data.get('pre_close', 0) * 1.1, 2)  # 涨停目标价
-                auc_data['support_price'] = round(auc_data.get('auction_open', 0) * 0.98, 2)  # 支撑位
-                morning_stocks.append(auc_data)
-        except Exception as e:
-            print(f"⚠️ 跳过早盘选股 {code}：{str(e)}")
-            continue
-
-    # 早盘即时结果推送
-    print("\\n🌅 【早盘即时选股结果】（竞价可买入）")
-    wechat_content = f"🌅 早盘即时选股结果（{latest_trading_day}）\\n（9:25-9:30竞价买入，不破支撑位持有）\\n"
-    if morning_stocks:
-        for i, stock in enumerate(morning_stocks[:3], 1):
-            line = f"{i}. {stock['name']}（{stock['code']}）\\n  竞价高开：{stock['auction_pct']}% | 支撑位：{stock['support_price']}元 | 目标价：{stock['target_price']}元"
-            print(line)
-            wechat_content += line + "\\n"
-    else:
-        wechat_content = f"🌅 早盘即时选股结果（{latest_trading_day}）\\n⚠️ 暂无符合条件的早盘标的"
-        print(wechat_content)
     
-    send_wechat_message(wechat_content)
-    return morning_stocks
-
-# ====================== 8. 持仓分析（保留逻辑，替换数据函数） ======================
-def hold_analysis():
-    """持仓股票实时分析"""
-    hold_suggestions = []
-    print("\\n📈 开始持仓分析...")
-
-    for code in HOLD_STOCK_LIST:
-        try:
-            rt_data = get_tushare_data(code, "realtime")
-            if not rt_data:
-                continue
-
-            # 趋势判断 + 操作建议
-            pct_chg = rt_data.get('pct_chg', 0)
-            if pct_chg > 3:
-                trend = "强势上涨"
-                suggestion = "✅ 持有，不破5日线不卖"
-            elif 0 < pct_chg <= 3:
-                trend = "震荡上涨"
-                suggestion = "✅ 持有，可小仓位加仓"
-            elif -3 < pct_chg <= 0:
-                trend = "震荡调整"
-                suggestion = "⚠️ 观望，做T（高抛低吸）"
-            else:
-                trend = "弱势下跌"
-                suggestion = "❌ 减仓，止损位：" + str(round(rt_data.get('pre_close', 0) * 0.97, 2))
-
-            hold_suggestions.append({
-                **rt_data,
-                'trend': trend,
-                'suggestion': suggestion
-            })
-        except Exception as e:
-            print(f"⚠️ 跳过持仓股 {code}：{str(e)}")
-            continue
-    return hold_suggestions
-
-# ====================== 9. 尾盘分析（保留逻辑，替换数据函数） ======================
-def tail_analysis():
-    """尾盘分析 + 即时微信推送"""
-    tail_stocks = []
-    print("\\n🔥 开始尾盘分析...")
-
-    for code in STOCK_POOL:
-        try:
-            tail_data = get_tushare_data(code, "tail")
-            if not tail_data:
-                continue
-
-            # 选股条件（空值兜底）
-            cond1 = 1 < tail_data.get('pct_chg', 0) < 5             # 尾盘涨幅1%-5%
-            cond2 = 5 < tail_data.get('turnover', 0) < 15           # 换手率5%-15%
-            cond3 = tail_data.get('vol_ratio', 0) >= 1.5            # 量比≥1.5
-            cond4 = tail_data.get('price', 0) > tail_data.get('high', 0) * 0.98  # 收盘价靠近最高价
-
-            if all([cond1, cond2, cond3, cond4]):
-                tail_data['next_target'] = round(tail_data.get('pre_close', 0) * 1.1, 2)  # 次日涨停目标价
-                tail_data['buy_price'] = round(tail_data.get('price', 0) * 1.01, 2)  # 尾盘买入价
-                tail_stocks.append(tail_data)
-        except Exception as e:
-            print(f"⚠️ 跳过尾盘选股 {code}：{str(e)}")
-            continue
-
-    # 尾盘即时结果推送
-    print("\\n🔥 【尾盘即时选股结果】（可直接买入）")
-    wechat_content = f"🔥 尾盘即时选股结果（{latest_trading_day}）\\n（14:57-15:00买入，次日冲高止盈）\\n"
-    if tail_stocks:
-        for i, stock in enumerate(tail_stocks[:3], 1):
-            line = f"{i}. {stock['name']}（{stock['code']}）\\n  尾盘价：{stock['price']}元 | 买入价：{stock['buy_price']}元 | 次日目标：{stock['next_target']}元"
-            print(line)
-            wechat_content += line + "\\n"
-    else:
-        wechat_content = f"🔥 尾盘即时选股结果（{latest_trading_day}）\\n⚠️ 暂无符合条件的尾盘标的"
-        print(wechat_content)
+    # 安全过滤 → 低位过滤 → 启动判断
+    if not is_safe_trade(stock_data):
+        return None
+    if not is_low_real(stock_data):
+        return None
+    if not is_real_start(stock_data):
+        return None
     
-    send_wechat_message(wechat_content)
-    return tail_stocks
+    # 计算止损/止盈价
+    stock_data["stop_loss"] = round(float(stock_data["price"]) * STOP_LOSS, 2)
+    stock_data["take_profit"] = round(float(stock_data["price"]) * TAKE_PROFIT, 2)
+    return stock_data
 
-# ====================== 10. 生成完整报告 + 推送（保留） ======================
-def generate_full_report():
-    """生成完整分析报告 + 微信推送"""
-    now = datetime.now()
-    report = f"""
-=====================================
-📅 短线交易分析报告（{now.strftime('%Y-%m-%d %H:%M:%S')}）
-📌 数据来源：{latest_trading_day} | 选股池数量：{len(STOCK_POOL)}
-=====================================
+# ====================== 全市场扫描池 ======================
+def get_pool():
+    """获取扫描池（全市场低位放量股+自选股）"""
+    codes = []
+    try:
+        # 全市场A股列表（前300只）
+        url = "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=300&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()["data"]["diff"]
+        codes = [item["f12"] for item in data]
+    except Exception as e:
+        print(f"⚠️ 获取全市场股票失败：{e}")
+    
+    # 加入自选股并去重
+    codes += HOLD_STOCK_LIST
+    codes = list(set([c for c in codes if c.startswith(('60', '00', '30'))]))
+    
+    return codes[:300]  # 限制扫描数量，避免卡顿
 
-【一、早盘竞价分析（9:25-9:30）】
-"""
-    # 早盘模块
-    morning_stocks = morning_analysis()
-    if morning_stocks:
-        for i, stock in enumerate(morning_stocks, 1):
-            report += f"""
-【{i}. {stock['name']}（{stock['code']}）】
-竞价高开：{stock['auction_pct']}% | 竞价量：{stock['auction_vol']:.0f}手
-开盘价：{stock['auction_open']}元 | 当前价：{stock['price']}元
-支撑位：{stock['support_price']}元 | 当日目标价：{stock['target_price']}元
-操作建议：✅ 竞价买入，不破支撑位持有至大涨
-"""
-    else:
-        report += "⚠️ 暂无符合条件的早盘标的\\n"
+# ====================== 盘中实时监控 ======================
+def monitor():
+    """盘中实时监控主逻辑"""
+    send_wechat("✅ 【稳健版】低位启动涨停系统已启动（1分钟级监控）")
+    pushed_codes = set()  # 避免重复推送
+    
+    while True:
+        # 非交易时间休眠
+        if not is_trading_time():
+            time.sleep(60)
+            pushed_codes.clear()
+            continue
+        
+        # 大盘环境不安全时，暂停推送
+        if not market_is_safe():
+            time.sleep(60)
+            continue
+        
+        # 扫描全市场股票
+        for code in get_pool():
+            result = scan_one(code)
+            if result and code not in pushed_codes:
+                # 推送消息
+                msg = f"""
+🚀 【稳健版】低位启动信号
+📈 标的：{result['name']}（{result['code']}）
+💰 现价：{result['price']} 元
+🛡️ 止损：{result['stop_loss']} 元
+🎯 止盈：{result['take_profit']} 元
+📌 仓位：1～3成
+💡 逻辑：低位+真启动+安全环境
+                """
+                send_wechat(msg)
+                pushed_codes.add(code)
+            time.sleep(0.2)  # 防接口限流
+        
+        # 按间隔休眠
+        time.sleep(SCAN_INTERVAL)
 
-    # 持仓模块
-    report += """
--------------------------------------
-【二、持仓股票操作建议】
-"""
-    hold_suggestions = hold_analysis()
-    if hold_suggestions:
-        for stock in hold_suggestions:
-            report += f"""
-【{stock['name']}（{stock['code']}）】
-当前价：{stock['price']}元 | 涨跌幅：{stock['pct_chg']}%
-趋势判断：{stock['trend']}
-操作建议：{stock['suggestion']}
-"""
-    else:
-        report += "⚠️ 暂无持仓数据或持仓分析失败\\n"
-
-    # 尾盘模块
-    report += """
--------------------------------------
-【三、尾盘买入分析（14:57-15:00）】
-"""
-    tail_stocks = tail_analysis()
-    if tail_stocks:
-        for i, stock in enumerate(tail_stocks, 1):
-            report += f"""
-【{i}. {stock['name']}（{stock['code']}）】
-尾盘价：{stock['price']}元 | 涨跌幅：{stock['pct_chg']}%
-换手率：{stock['turnover']:.1f}% | 量比：{stock['vol_ratio']:.1f}
-买入价：{stock['buy_price']}元 | 次日目标价：{stock['next_target']}元
-操作建议：✅ 尾盘买入，次日冲高止盈（目标涨停）
-"""
-    else:
-        report += "⚠️ 暂无符合条件的尾盘标的\\n"
-
-    # 保存报告
-    os.makedirs('reports', exist_ok=True)
-    report_path = f"reports/交易分析报告_{latest_trading_day}_{now.strftime('%H%M')}.txt"
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write(report)
-
-    print("\\n" + "="*60)
-    print("📋 完整分析报告已生成：", report_path)
-    print("="*60)
-
-    # 推送完整报告到微信
-    send_wechat_message(report, is_report=True)
-    return report
-
-# ====================== 11. 主函数（保留） ======================
-if __name__ == '__main__':
-    print("🚀 开始执行：双模式选股池分析（自选+自动）")
-    generate_full_report()
-    print(f"\\n✅ 所有分析完成！数据日期：{latest_trading_day}")
+# ====================== 启动入口 ======================
+if __name__ == "__main__":
+    print("=====================================")
+    print("🚀 稳健版低位启动涨停系统 V2.0 已启动")
+    print("📌 监控频率：1分钟/次 | 交易时间：9:30-15:00")
+    print("=====================================")
+    
+    # 启动监控线程
+    monitor_thread = threading.Thread(target=monitor)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+    
+    # 主线程保持运行
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        send_wechat("🛑 【稳健版】低位启动监控系统已停止")
+        print("\n🛑 系统已停止")
