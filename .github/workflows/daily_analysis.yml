@@ -1,42 +1,71 @@
+# GitHub Actions 股票监控工作流（适配第三方Tushare）
 name: Stock Monitor (Third-Party Tushare)
 
+# 触发规则：手动触发 + 周一到周五9:20自动触发（UTC+8 → GitHub UTC时区为1:20）
 on:
-  workflow_dispatch:
-  # 周一到周五 9:20 自动启动（UTC+8 → GitHub UTC 时区是 1:20）
+  workflow_dispatch:  # 手动触发按钮
   schedule:
-    - cron: '20 1 * * 1-5'
+    - cron: '20 1 * * 1-5'  # 定时触发规则（分 时 日 月 周）
 
+# 任务配置
 jobs:
-  run-monitor:
+  run-stock-monitor:
+    # 运行环境：Ubuntu最新版
     runs-on: ubuntu-latest
+    
+    # 任务步骤
     steps:
-      - uses: actions/checkout@v4
+      # 步骤1：拉取仓库代码到运行环境
+      - name: Checkout repository code
+        uses: actions/checkout@v4
 
-      - name: Set up Python
+      # 步骤2：配置Python环境（3.10版本兼容所有Tushare版本）
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'  # 兼容第三方 Tushare 最佳版本
+          python-version: '3.10'
+          cache: 'pip'  # 缓存pip包，加速后续运行
 
-      # 安装依赖（仅安装基础库，不覆盖第三方 Tushare）
+      # 步骤3：安装依赖（核心！适配第三方Tushare）
       - name: Install dependencies
         run: |
+          # 升级pip
           python -m pip install --upgrade pip
-          pip install requests pandas  # 只装基础库，不装官方 tushare
-          pip install python-dotenv
+          
+          # 方案1：如果卖家给了.whl安装包（优先用这个！）
+          # 请把卖家给的tushare.whl文件上传到仓库根目录，然后修改下面的文件名
+          # pip install tushare-xxx-py3-none-any.whl
+          
+          # 方案2：应急用官方版Tushare（仅测试程序，不能用卖家积分）
+          pip install tushare==1.4.24
+          
+          # 安装基础依赖（必装）
+          pip install requests pandas python-dotenv
 
-      # 配置敏感信息（推荐用 GitHub Secrets）
+      # 步骤4：配置环境变量（敏感信息从GitHub Secrets读取）
       - name: Set environment variables
         env:
+          # 从GitHub Secrets读取配置（需提前在仓库Settings里添加）
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
         run: |
+          # 将环境变量写入系统，供main.py读取
           echo "WECHAT_WEBHOOK_URL=$WECHAT_WEBHOOK_URL" >> $GITHUB_ENV
           echo "TUSHARE_TOKEN=$TUSHARE_TOKEN" >> $GITHUB_ENV
           echo "HOLD_STOCK_LIST=$HOLD_STOCK_LIST" >> $GITHUB_ENV
 
-      # 运行监控程序（8小时超时，避免资源浪费）
-      - name: Run stock monitor
+      # 步骤5：运行监控程序（8小时后自动停止，避免资源浪费）
+      - name: Run stock monitoring script
         run: |
+          # 运行main.py
           python main.py
+          # 运行8小时后自动结束（覆盖全天交易时间）
           sleep 28800
+
+      # 步骤6：可选 - 输出运行日志（方便排查问题）
+      - name: Show runtime logs
+        if: always()  # 即使前面步骤失败，也输出日志
+        run: |
+          echo "Stock monitor workflow finished"
+          echo "Logs path: $GITHUB_WORKSPACE"
