@@ -1,5 +1,5 @@
-# GitHub Actions 股票监控工作流（东方财富版，0积分）
-name: Stock Monitor (DFCF Free Version)
+# GitHub Actions 股票监控工作流（东财+DeepSeek AI版）
+name: Stock Monitor (DFCF + DeepSeek AI)
 
 # 触发规则：手动 + 周一到周五9:20自动触发
 on:
@@ -22,20 +22,26 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      # 安装基础依赖（仅requests/pandas，无需Tushare）
+      # 安装依赖（包含AI调用所需的requests）
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas python-dotenv
 
-      # 配置环境变量
+      # 配置环境变量（恢复AI相关配置）
       - name: Set environment variables
         env:
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           HOLD_STOCK_LIST: ${{ secrets.HOLD_STOCK_LIST }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
         run: |
           echo "WECHAT_WEBHOOK_URL=$WECHAT_WEBHOOK_URL" >> $GITHUB_ENV
           echo "HOLD_STOCK_LIST=$HOLD_STOCK_LIST" >> $GITHUB_ENV
+          echo "OPENAI_API_KEY=$OPENAI_API_KEY" >> $GITHUB_ENV
+          echo "OPENAI_BASE_URL=$OPENAI_BASE_URL" >> $GITHUB_ENV
+          echo "OPENAI_MODEL=$OPENAI_MODEL" >> $GITHUB_ENV
 
       # 运行监控程序
       - name: Run stock monitoring script
@@ -43,8 +49,8 @@ jobs:
           python main.py
           sleep 28800  # 8小时后自动结束
 
-      # 输出日志（方便排查）
+      # 输出日志
       - name: Show runtime logs
         if: always()
         run: |
-          echo "Stock monitor workflow finished (DFCF version)"
+          echo "Stock monitor workflow finished (DFCF + DeepSeek AI version)"
