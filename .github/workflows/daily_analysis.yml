@@ -1,15 +1,14 @@
-name: Daily Stock Analysis
+name: Double-Strategy-Stock-Monitor
 
 on:
-  # 定时触发（早盘9:27、尾盘14:52，覆盖全场景分析）
+  # 开盘前启动（北京时间9:20）
   schedule:
-    - cron: '27 1 * * 1-5'  # 北京时间9:27 → 执行早盘+持仓分析
-    - cron: '52 6 * * 1-5'  # 北京时间14:52 → 执行尾盘+持仓分析
-  # 手动触发（可随时执行全量分析）
+    - cron: '20 1 * * 1-5'
+  # 手动触发
   workflow_dispatch:
 
 jobs:
-  stock-analysis-job:
+  stock-monitor-job:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
@@ -26,19 +25,21 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 3. 安装依赖（指定tushare 1.4.24版本）
+      - name: 3. 安装依赖
         run: |
-          pip install --upgrade pip
-          pip install requests pandas tushare==1.4.24
+          python -m pip install --upgrade pip
+          pip install requests pandas
 
-      - name: 4. 执行核心分析（含早盘+持仓+尾盘）
-        run: |
-          echo "开始执行：早盘分析 → 持仓分析 → 尾盘分析"
-          python main.py  # 注意：如果你的代码文件不是main.py，这里要改成实际文件名
+      - name: 4. 启动稳健版监控（后台运行）
+        run: python main.py &
 
-      - name: 5. 上传分析报告（含持仓分析结果）
+      - name: 5. 启动激进版监控
+        run: python main_aggr.py
+
+      - name: 6. 上传运行日志
         uses: actions/upload-artifact@v4
         with:
-          name: stock-analysis-report
-          path: reports/
+          name: double-strategy-logs
+          path: |
+            *.log
           retention-days: 7
