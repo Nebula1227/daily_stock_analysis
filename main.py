@@ -7,41 +7,52 @@ from datetime import datetime, timedelta
 import tushare as ts
 
 # ====================== 【全局配置】 ======================
-# 1. Tushare 配置（替换成你的 token）
-TUSHARE_TOKEN = "你的Tushare token"
-ts.set_token(TUSHARE_TOKEN)
-pro = ts.pro_api()
+# 1. 第三方 Tushare 核心配置（必须按卖家给的填！）
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "你的第三方Tushare Token")  # 替换为真实Token
+pro = ts.pro_api(TUSHARE_TOKEN)
+# 关键：第三方代理版必须的配置（不要改URL！）
+pro._DataApi__token = TUSHARE_TOKEN
+pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
 
 # 2. 微信推送配置
-WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "")
+WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "你的微信WebHook地址")
 
-# 3. 选股参数（和之前一致）
+# 3. 选股参数（积分节流优化版）
 LOW_PRICE_MAX = 20
 LOW_RANGE_MAX = 0.15
 RISE_5D_MAX = 12
-MV_MIN = 30  # 亿
-MV_MAX = 150 # 亿
+MV_MIN = 30    # 流通市值下限（亿）
+MV_MAX = 150   # 流通市值上限（亿）
 VOL_MIN = 1.6
 VOL_MAX = 5
 STOP_LOSS = 0.96
 TAKE_PROFIT = 1.08
-SCAN_INTERVAL = 60
-AGGR_SCAN_INTERVAL = 45
+SCAN_INTERVAL = 60       # 稳健版扫描间隔（秒）
+AGGR_SCAN_INTERVAL = 45  # 激进版扫描间隔（秒）
 AGGR_VOL_RATIO_MIN = 2.5
 AGGR_TURNOVER_MAX = 12
-AGGR_AMOUNT_MIN = 2 # 亿
+AGGR_AMOUNT_MIN = 2      # 激进版成交额下限（亿）
 
-# 4. 持仓股列表
+# 4. 持仓股列表（逗号分隔，如：000001,600036,300750）
 HOLD_STOCK_LIST = [c.strip() for c in os.getenv("HOLD_STOCK_LIST", "").split(",") if c.strip()]
+
+# 5. 积分节流配置（核心！控制每日消耗≤1500积分）
+AUCTION_POOL_SIZE = 50   # 竞价池大小（原100→50）
+ROBIN_POOL_SIZE = 100    # 稳健池大小（原200→100）
+AGGR_POOL_SIZE = 50      # 激进池大小（原100→50）
 
 # ====================== 工具函数 ======================
 def send_wechat(msg):
+    """微信推送（失败自动重试）"""
     if not WECHAT_WEBHOOK_URL:
         return
-    try:
-        requests.post(WECHAT_WEBHOOK_URL, json={"msgtype": "text", "text": {"content": msg.strip()}})
-    except Exception as e:
-        print(f"微信推送失败：{e}")
+    for _ in range(2):  # 重试2次
+        try:
+            requests.post(WECHAT_WEBHOOK_URL, json={"msgtype": "text", "text": {"content": msg.strip()}}, timeout=10)
+            return
+        except Exception as e:
+            print(f"微信推送失败：{e}")
+            time.sleep(2)
 
 def is_trading_time():
     """判断是否在交易时间"""
@@ -54,328 +65,265 @@ def is_auction_time(morning=True):
     """判断是否在真实竞价时段"""
     now = datetime.now().time()
     if morning:
-        # 早盘真实竞价：9:24-9:25（不可撤单）
         start = datetime.strptime("09:24:00", "%H:%M:%S").time()
         end = datetime.strptime("09:25:00", "%H:%M:%S").time()
     else:
-        # 尾盘竞价：14:57-15:00
         start = datetime.strptime("14:57:00", "%H:%M:%S").time()
         end = datetime.strptime("15:00:00", "%H:%M:%S").time()
     return start <= now <= end
 
-# ====================== Tushare 数据获取核心函数 ======================
+# ====================== Tushare 数据获取（适配第三方） ======================
 def get_stock_basic():
-    """获取股票基础信息（Tushare，1次/天，消耗20积分）"""
+    """获取股票基础信息（1次/天，消耗20积分）"""
     try:
-        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry,list_date,market,circ_mv')
-        # 转换流通市值为亿元
-        df['circ_mv'] = df['circ_mv'].astype(float) / 10000
-        return df
+        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,circ_mv')
+        df['circ_mv'] = df['circ_mv'].astype(float) / 10000  # 转换为亿元
+        return df[df['circ_mv'].notna()]
     except Exception as e:
         print(f"获取股票基础信息失败：{e}")
+        send_wechat(f"❌ 获取股票基础信息失败：{str(e)[:50]}")
         return pd.DataFrame()
 
 def get_auction_data_ts(ts_code):
-    """获取竞价数据（Tushare，1次/只，消耗5积分）"""
+    """获取竞价数据（1次/只，消耗5积分）"""
     try:
-        # 获取当日日期
         today = datetime.now().strftime("%Y%m%d")
-        # Tushare 竞价接口
         df = pro.auction_detail(ts_code=ts_code, trade_date=today)
         if df.empty:
             return None
-        
-        # 取最后一笔（9:25）的竞价数据
-        last_auction = df.iloc[-1]
+        last = df.iloc[-1]
         return {
             "ts_code": ts_code,
-            "symbol": last_auction['symbol'],
-            "name": last_auction['name'],
-            "price": last_auction['open'],          # 竞价价格
-            "auction_vol": last_auction['vol'],     # 竞价成交量（手）
-            "auction_amount": last_auction['amount'], # 竞价成交额（万元）
-            "rise": last_auction['pct_chg']         # 竞价涨幅（%）
+            "symbol": last['symbol'],
+            "name": last['name'],
+            "price": last['open'],
+            "auction_vol": last['vol'],
+            "auction_amount": last['amount'],
+            "rise": last['pct_chg']
         }
     except Exception as e:
         print(f"获取{ts_code}竞价数据失败：{e}")
         return None
 
 def get_realtime_data_ts(ts_code):
-    """获取实时行情数据（Tushare，1次/只，消耗2积分）"""
+    """获取实时行情（1次/只，消耗2积分）"""
     try:
-        # 实时行情接口
-        df = pro.daily(ts_code=ts_code, start_date=datetime.now().strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"))
+        today = datetime.now().strftime("%Y%m%d")
+        df = pro.daily(ts_code=ts_code, trade_date=today)
         if df.empty:
-            # 备用：获取分时数据
-            df = pro.minute_bar(ts_code=ts_code, start_time=datetime.now().strftime("%H:%M"), end_time=datetime.now().strftime("%H:%M"))
-            if df.empty:
-                return None
+            df = pro.minute_bar(ts_code=ts_code, start_time="09:30", end_time=datetime.now().strftime("%H:%M"))
+        if df.empty:
+            return None
         
-        # 获取基础信息
-        basic_df = get_stock_basic()
-        basic = basic_df[basic_df['ts_code'] == ts_code].iloc[0] if not basic_df.empty else None
+        basic = get_stock_basic()
+        basic_info = basic[basic['ts_code'] == ts_code].iloc[0] if not basic.empty else None
         
         return {
             "ts_code": ts_code,
-            "symbol": basic['symbol'] if basic else ts_code[:6],
-            "name": basic['name'] if basic else "",
-            "price": df.iloc[0]['close'],          # 当前价格
-            "avg_price": df.iloc[0]['avg_price'],  # 均价
-            "vol_ratio": df.iloc[0]['vol_ratio'],  # 量比
-            "turnover": df.iloc[0]['turnover'],    # 换手率
-            "amount": df.iloc[0]['amount'] / 10000, # 成交额（亿元）
-            "circ_mv": basic['circ_mv'] if basic else 0, # 流通市值（亿元）
-            "low30": df.iloc[0]['low_30d'],        # 30日低点
-            "rise5d": df.iloc[0]['pct_chg_5d']     # 近5日涨幅
+            "symbol": basic_info['symbol'] if basic_info else ts_code[:6],
+            "name": basic_info['name'] if basic_info else "",
+            "price": df.iloc[0]['close'],
+            "avg_price": df.iloc[0].get('avg_price', df.iloc[0]['close']),
+            "vol_ratio": df.iloc[0].get('vol_ratio', 1.0),
+            "turnover": df.iloc[0].get('turnover', 0.0),
+            "amount": df.iloc[0]['amount'] / 10000,
+            "circ_mv": basic_info['circ_mv'] if basic_info else 0,
+            "low30": df.iloc[0].get('low_30d', df.iloc[0]['low']),
+            "rise5d": df.iloc[0].get('pct_chg_5d', 0.0)
         }
     except Exception as e:
         print(f"获取{ts_code}实时数据失败：{e}")
         return None
 
 def get_5min_verify_data_ts(ts_code):
-    """获取开盘5分钟验证数据（Tushare，1次/只，消耗3积分）"""
+    """开盘5分钟验证（1次/只，消耗3积分）"""
     try:
-        today = datetime.now().strftime("%Y%m%d")
-        # 获取9:30-9:35的5分钟K线
         df = pro.minute_bar(ts_code=ts_code, start_time="09:30", end_time="09:35", freq='5min')
         if df.empty:
             return None
-        
         return {
             "ts_code": ts_code,
-            "open_price": df.iloc[0]['open'],      # 开盘价
-            "close_price": df.iloc[0]['close'],    # 9:35价格
-            "avg_price": df.iloc[0]['avg_price'],  # 均价
-            "vol_ratio": df.iloc[0]['vol_ratio'],  # 量比
-            "rise": df.iloc[0]['pct_chg']          # 涨幅
+            "open_price": df.iloc[0]['open'],
+            "close_price": df.iloc[0]['close'],
+            "avg_price": df.iloc[0]['avg_price'],
+            "vol_ratio": df.iloc[0]['vol_ratio'],
+            "rise": df.iloc[0]['pct_chg']
         }
     except Exception as e:
         print(f"验证{ts_code}失败：{e}")
         return None
 
-# ====================== 竞价选股逻辑（纯 Tushare 版） ======================
+# ====================== 竞价选股（积分节流版） ======================
 def scan_auction_ts(morning=True):
-    """竞价选股（纯 Tushare 数据）"""
-    send_wechat(f"🔍 开始{('早盘真实' if morning else '尾盘')}竞价选股（Tushare数据源）")
-    
-    # 1. 获取股票池（基础信息，1次/天）
-    basic_df = get_stock_basic()
-    if basic_df.empty:
-        send_wechat("❌ 获取股票基础信息失败，竞价选股终止")
+    """竞价选股（仅50只，每日消耗≤250积分）"""
+    send_wechat(f"🔍 开始{('早盘' if morning else '尾盘')}竞价选股（第三方Tushare）")
+    basic = get_stock_basic()
+    if basic.empty:
         return
     
-    # 2. 筛选基础条件（低位+流通市值）
-    filter_df = basic_df[
-        (basic_df['circ_mv'] >= MV_MIN) & 
-        (basic_df['circ_mv'] <= MV_MAX)
-    ]
-    # 合并自选股
-    if HOLD_STOCK_LIST:
-        filter_df = filter_df[filter_df['symbol'].isin(HOLD_STOCK_LIST)]
-    stock_pool = filter_df['ts_code'].tolist()[:100]  # 限制100只，控制积分消耗
+    # 筛选基础池（30-150亿流通市值）
+    pool = basic[
+        (basic['circ_mv'] >= MV_MIN) & 
+        (basic['circ_mv'] <= MV_MAX)
+    ]['ts_code'].tolist()[:AUCTION_POOL_SIZE]
     
-    # 3. 扫描竞价数据
-    good_stocks = []
-    for ts_code in stock_pool:
-        auction_data = get_auction_data_ts(ts_code)
-        if not auction_data:
+    # 扫描竞价数据
+    good = []
+    for ts_code in pool:
+        data = get_auction_data_ts(ts_code)
+        if not data:
             continue
-        
-        # 竞价核心筛选条件
         try:
-            price = auction_data['price']
-            auction_vol = auction_data['auction_vol']
-            rise = auction_data['rise']
-            
-            # 基础条件
-            cond1 = price <= LOW_PRICE_MAX
-            # 竞价量（早盘≥800手，尾盘≥300手）
-            cond2 = auction_vol >= (800 if morning else 300)
-            # 涨幅（早盘2%-6%，尾盘0%-3%）
-            cond3 = (2 <= rise <= 6) if morning else (0 <= rise <= 3)
-            
-            if all([cond1, cond2, cond3]):
-                good_stocks.append(auction_data)
+            price = data['price']
+            vol = data['auction_vol']
+            rise = data['rise']
+            # 核心条件
+            if (price <= LOW_PRICE_MAX and 
+                vol >= (800 if morning else 300) and 
+                (2 <= rise <= 6 if morning else 0 <= rise <= 3)):
+                good.append(data)
         except Exception as e:
-            print(f"筛选{ts_code}失败：{e}")
             continue
     
-    # 4. 早盘竞价需要开盘验证
-    if morning and good_stocks:
-        send_wechat(f"📌 早盘竞价初选{len(good_stocks)}只标的，9:35验证开盘强势")
-        verified_stocks = verify_open_5min_ts(good_stocks)
-        
-        if verified_stocks:
-            msg = f"🎉 早盘竞价【最终验证通过】优质标的（Tushare）\n"
-            for i, s in enumerate(verified_stocks[:3]):
+    # 早盘验证，尾盘直接推送
+    if morning and good:
+        send_wechat(f"📌 早盘竞价初选{len(good)}只标的，9:35验证后推送")
+        verified = verify_open_5min_ts(good)
+        if verified:
+            msg = "🎉 早盘竞价【最终验证通过】\n"
+            for i, s in enumerate(verified[:3]):
                 msg += f"{i+1}. {s['name']}({s['symbol']})\n"
                 msg += f"   竞价价：{s['price']} | 开盘价：{s['open_price']}\n"
-                msg += f"   竞价涨幅：{s['rise']}% | 开盘涨幅：{s['rise_open']}%\n"
             send_wechat(msg)
         else:
-            send_wechat(f"😶 早盘竞价标的开盘后未延续强势")
-    elif good_stocks:
-        # 尾盘竞价直接推送
-        msg = f"🎉 尾盘竞价优质标的（Tushare）\n"
-        for i, s in enumerate(good_stocks[:3]):
-            msg += f"{i+1}. {s['name']}({s['symbol']})\n"
-            msg += f"   竞价价：{s['price']} | 竞价量：{s['auction_vol']}手 | 涨幅：{s['rise']}%\n"
+            send_wechat("😶 早盘竞价标的开盘后未延续强势")
+    elif good:
+        msg = "🎉 尾盘竞价优质标的\n"
+        for i, s in enumerate(good[:3]):
+            msg += f"{i+1}. {s['name']}({s['symbol']}) 现价：{s['price']} 涨幅：{s['rise']}%\n"
         send_wechat(msg)
     else:
         send_wechat(f"😶 {('早盘' if morning else '尾盘')}竞价暂无优质标的")
 
-# ====================== 开盘5分钟验证（纯 Tushare 版） ======================
 def verify_open_5min_ts(auction_stocks):
-    """开盘5分钟验证（Tushare）"""
-    send_wechat("⏳ 开始验证竞价标的开盘强势度（Tushare）")
-    verified_stocks = []
-    
+    """开盘5分钟验证（积分节流版）"""
+    send_wechat("⏳ 验证竞价标的开盘强势度...")
+    verified = []
     # 等待到9:35
     while datetime.now().time() < datetime.strptime("09:35:00", "%H:%M:%S").time():
         time.sleep(10)
     
-    # 验证每只标的
-    for stock in auction_stocks:
-        verify_data = get_5min_verify_data_ts(stock['ts_code'])
-        if not verify_data:
+    for stock in auction_stocks[:AUCTION_POOL_SIZE]:  # 限制验证数量
+        data = get_5min_verify_data_ts(stock['ts_code'])
+        if not data:
             continue
-        
-        # 验证条件
-        auction_price = stock['price']
-        open_price = verify_data['open_price']
-        current_price = verify_data['close_price']
-        avg_price = verify_data['avg_price']
-        vol_ratio = verify_data['vol_ratio']
-        rise_auction = stock['rise']
-        rise_open = verify_data['rise']
-        
         # 核心验证条件
-        cond1 = open_price >= auction_price * 0.995  # 开盘不低开
-        cond2 = current_price >= avg_price * 0.995    # 股价在均价线上方
-        cond3 = vol_ratio >= 1.2                     # 量比≥1.2
-        cond4 = rise_open >= rise_auction * 0.7       # 涨幅保留70%以上
-        
+        cond1 = data['open_price'] >= stock['price'] * 0.995
+        cond2 = data['close_price'] >= data['avg_price'] * 0.995
+        cond3 = data['vol_ratio'] >= 1.2
+        cond4 = data['rise'] >= stock['rise'] * 0.7
         if all([cond1, cond2, cond3, cond4]):
-            verified_stocks.append({
+            verified.append({
                 "name": stock['name'],
                 "symbol": stock['symbol'],
-                "price": auction_price,
-                "open_price": open_price,
-                "rise_auction": rise_auction,
-                "rise_open": rise_open,
-                "vol_ratio": vol_ratio
+                "price": stock['price'],
+                "open_price": data['open_price'],
+                "rise_auction": stock['rise'],
+                "rise_open": data['rise'],
+                "vol_ratio": data['vol_ratio']
             })
-    
-    return verified_stocks
+    return verified
 
-# ====================== 盘中稳健版选股（纯 Tushare 版） ======================
+# ====================== 盘中选股（积分节流版） ======================
 def scan_robin_ts():
-    """稳健版选股（Tushare）"""
-    basic_df = get_stock_basic()
-    if basic_df.empty:
+    """稳健版选股（100只，每日消耗≤1200积分）"""
+    basic = get_stock_basic()
+    if basic.empty:
         return []
+    pool = basic[
+        (basic['circ_mv'] >= MV_MIN) & 
+        (basic['circ_mv'] <= MV_MAX)
+    ]['ts_code'].tolist()[:ROBIN_POOL_SIZE]
     
-    # 筛选基础池
-    filter_df = basic_df[
-        (basic_df['circ_mv'] >= MV_MIN) & 
-        (basic_df['circ_mv'] <= MV_MAX)
-    ]
-    stock_pool = filter_df['ts_code'].tolist()[:200]  # 限制200只
-    
-    good_stocks = []
-    for ts_code in stock_pool:
-        real_data = get_realtime_data_ts(ts_code)
-        if not real_data:
+    good = []
+    for ts_code in pool:
+        data = get_realtime_data_ts(ts_code)
+        if not data:
             continue
-        
-        # 稳健版筛选条件
         try:
-            price = real_data['price']
-            vol_ratio = real_data['vol_ratio']
-            avg_price = real_data['avg_price']
-            amount = real_data['amount']
-            low30 = real_data['low30']
-            rise5d = real_data['rise5d']
+            price = data['price']
+            vol_ratio = data['vol_ratio']
+            avg_price = data['avg_price']
+            amount = data['amount']
+            low30 = data['low30']
+            rise5d = data['rise5d']
             
-            cond1 = price <= LOW_PRICE_MAX
-            cond2 = (price - low30) / low30 <= LOW_RANGE_MAX
-            cond3 = rise5d <= RISE_5D_MAX
-            cond4 = VOL_MIN <= vol_ratio <= VOL_MAX
-            cond5 = price >= avg_price * 0.995
-            cond6 = amount >= 1.5  # 成交额≥1.5亿
-            
-            if all([cond1, cond2, cond3, cond4, cond5, cond6]):
-                real_data['stop'] = round(price * STOP_LOSS, 2)
-                real_data['take'] = round(price * TAKE_PROFIT, 2)
-                good_stocks.append(real_data)
+            # 筛选条件
+            if (price <= LOW_PRICE_MAX and 
+                (price - low30)/low30 <= LOW_RANGE_MAX and 
+                rise5d <= RISE_5D_MAX and 
+                VOL_MIN <= vol_ratio <= VOL_MAX and 
+                price >= avg_price * 0.995 and 
+                amount >= 1.5):
+                data['stop'] = round(price * STOP_LOSS, 2)
+                data['take'] = round(price * TAKE_PROFIT, 2)
+                good.append(data)
         except Exception as e:
-            print(f"稳健版筛选{ts_code}失败：{e}")
             continue
-    
-    return good_stocks
+    return good
 
-# ====================== 盘中激进版选股（纯 Tushare 版） ======================
 def scan_aggr_ts():
-    """激进版选股（Tushare）"""
-    basic_df = get_stock_basic()
-    if basic_df.empty:
+    """激进版选股（50只，每日消耗≤600积分）"""
+    basic = get_stock_basic()
+    if basic.empty:
         return []
+    pool = basic[
+        (basic['circ_mv'] >= MV_MIN) & 
+        (basic['circ_mv'] <= MV_MAX)
+    ]['ts_code'].tolist()[:AGGR_POOL_SIZE]
     
-    filter_df = basic_df[
-        (basic_df['circ_mv'] >= MV_MIN) & 
-        (basic_df['circ_mv'] <= MV_MAX)
-    ]
-    stock_pool = filter_df['ts_code'].tolist()[:100]  # 限制100只
-    
-    good_stocks = []
-    for ts_code in stock_pool:
-        real_data = get_realtime_data_ts(ts_code)
-        if not real_data:
+    good = []
+    for ts_code in pool:
+        data = get_realtime_data_ts(ts_code)
+        if not data:
             continue
-        
-        # 激进版筛选条件
         try:
-            price = real_data['price']
-            vol_ratio = real_data['vol_ratio']
-            avg_price = real_data['avg_price']
-            turnover = real_data['turnover']
-            amount = real_data['amount']
+            price = data['price']
+            vol_ratio = data['vol_ratio']
+            avg_price = data['avg_price']
+            turnover = data['turnover']
+            amount = data['amount']
             
-            cond1 = vol_ratio >= AGGR_VOL_RATIO_MIN
-            cond2 = price >= avg_price * 1.005
-            cond3 = turnover <= AGGR_TURNOVER_MAX
-            cond4 = amount >= AGGR_AMOUNT_MIN
-            cond5 = price <= LOW_PRICE_MAX
-            
-            if all([cond1, cond2, cond3, cond4, cond5]):
-                real_data['stop'] = round(price * 0.95, 2)  # 激进版止损5%
-                real_data['target'] = round(price * 1.1, 2) # 目标涨停
-                good_stocks.append(real_data)
+            # 筛选条件
+            if (vol_ratio >= AGGR_VOL_RATIO_MIN and 
+                price >= avg_price * 1.005 and 
+                turnover <= AGGR_TURNOVER_MAX and 
+                amount >= AGGR_AMOUNT_MIN and 
+                price <= LOW_PRICE_MAX):
+                data['stop'] = round(price * 0.95, 2)
+                data['target'] = round(price * 1.1, 2)
+                good.append(data)
         except Exception as e:
-            print(f"激进版筛选{ts_code}失败：{e}")
             continue
-    
-    return good_stocks
+    return good
 
-# ====================== 持仓分析（纯 Tushare 版） ======================
+# ====================== 持仓分析 ======================
 def hold_analysis_ts():
-    """持仓分析（Tushare）"""
-    msg = "📈 【持仓操作建议】（Tushare）\n"
+    """持仓分析（低消耗版）"""
+    msg = "📈 【持仓操作建议】\n"
     if not HOLD_STOCK_LIST:
         return "暂无持仓股"
     
     for symbol in HOLD_STOCK_LIST:
-        # 转换为 ts_code（6位代码+交易所）
         ts_code = f"{symbol}.SH" if symbol.startswith(('6', '9')) else f"{symbol}.SZ"
-        real_data = get_realtime_data_ts(ts_code)
-        
-        if not real_data:
+        data = get_realtime_data_ts(ts_code)
+        if not data:
             msg += f"{symbol}：获取数据失败\n"
             continue
         
-        price = real_data['price']
+        price = data['price']
         rise = (price / (price/1.01) - 1) * 100
-        name = real_data['name']
+        name = data['name']
         
         if rise > 3:
             sug = "持有，不破5日线不卖"
@@ -387,13 +335,12 @@ def hold_analysis_ts():
             sug = f"减仓，止损:{round(price * 0.97, 2)}"
         
         msg += f"{name}({symbol}) 涨幅:{rise:.1f}% → {sug}\n"
-    
     return msg
 
 # ====================== 监控线程 ======================
 def monitor_auction():
     """竞价监控线程"""
-    print("启动竞价监控（Tushare）")
+    print("启动竞价监控（第三方Tushare）")
     while True:
         if is_auction_time(morning=True):
             scan_auction_ts(morning=True)
@@ -406,65 +353,60 @@ def monitor_auction():
 
 def monitor_robin():
     """稳健版监控线程"""
-    print("启动稳健版监控（Tushare）")
-    last_push_hour = -1
+    print("启动稳健版监控（第三方Tushare）")
+    last_push = 0
     while True:
         if not is_trading_time():
             time.sleep(60)
             continue
         
-        # 扫描稳健版
-        robin_stocks = scan_robin_ts()
-        if robin_stocks:
-            msg = "🚀 稳健版信号（Tushare）\n"
-            for i, s in enumerate(robin_stocks[:3]):
-                msg += f"{i+1}. {s['name']}({s['symbol']})\n"
-                msg += f"   现价：{s['price']} | 止损：{s['stop']} | 止盈：{s['take']}\n"
+        # 扫描并推送
+        stocks = scan_robin_ts()
+        if stocks and (time.time() - last_push) > 300:  # 5分钟推一次，减少积分消耗
+            msg = "🚀 稳健版信号\n"
+            for i, s in enumerate(stocks[:3]):
+                msg += f"{i+1}. {s['name']}({s['symbol']}) 现价：{s['price']} 止损：{s['stop']} 止盈：{s['take']}\n"
             send_wechat(msg)
+            last_push = time.time()
         
         # 定时推送分析
-        current_hour = datetime.now().hour
-        current_min = datetime.now().minute
-        if current_hour == 9 and current_min == 35:
-            send_wechat(f"🌅 【早盘分析】（Tushare）\n{hold_analysis_ts()}")
-            last_push_hour = current_hour
-        elif current_hour == 11 and current_min == 30:
-            send_wechat(f"🍱 【午盘小结】（Tushare）\n{hold_analysis_ts()}")
-            last_push_hour = current_hour
-        elif current_hour == 14 and current_min == 30:
-            send_wechat(f"🔥 【尾盘分析】（Tushare）\n{hold_analysis_ts()}")
-            last_push_hour = current_hour
-        elif current_hour == 15 and current_min == 5:
-            send_wechat(f"📊 【收盘总结】（Tushare）\n{hold_analysis_ts()}")
-            last_push_hour = current_hour
+        now = datetime.now()
+        if now.hour == 9 and now.minute == 35:
+            send_wechat(f"🌅 【早盘分析】\n{hold_analysis_ts()}")
+        elif now.hour == 11 and now.minute == 30:
+            send_wechat(f"🍱 【午盘小结】\n{hold_analysis_ts()}")
+        elif now.hour == 14 and now.minute == 30:
+            send_wechat(f"🔥 【尾盘分析】\n{hold_analysis_ts()}")
+        elif now.hour == 15 and now.minute == 5:
+            send_wechat(f"📊 【收盘总结】\n{hold_analysis_ts()}")
         
         time.sleep(SCAN_INTERVAL)
 
 def monitor_aggr():
     """激进版监控线程"""
-    print("启动激进版监控（Tushare）")
+    print("启动激进版监控（第三方Tushare）")
+    last_push = 0
     while True:
         if not is_trading_time():
             time.sleep(60)
             continue
         
-        # 扫描激进版
-        aggr_stocks = scan_aggr_ts()
-        if aggr_stocks:
-            msg = "⚡️ 激进版信号（Tushare）\n"
-            for i, s in enumerate(aggr_stocks[:3]):
-                msg += f"{i+1}. {s['name']}({s['symbol']})\n"
-                msg += f"   现价：{s['price']} | 止损：{s['stop']} | 目标：{s['target']}\n"
+        stocks = scan_aggr_ts()
+        if stocks and (time.time() - last_push) > 240:  # 4分钟推一次
+            msg = "⚡️ 激进版信号\n"
+            for i, s in enumerate(stocks[:3]):
+                msg += f"{i+1}. {s['name']}({s['symbol']}) 现价：{s['price']} 止损：{s['stop']} 目标：{s['target']}\n"
             send_wechat(msg)
+            last_push = time.time()
         
         time.sleep(AGGR_SCAN_INTERVAL)
 
 # ====================== 主函数 ======================
 if __name__ == "__main__":
     # 启动通知
-    send_wechat("✅ 终极版监控系统（纯Tushare）已启动\n包含：真实竞价+开盘验证+稳健+激进+持仓分析")
+    send_wechat("✅ 终极版监控系统（第三方Tushare）已启动\n积分节流模式：每日消耗≤1500积分\n7天10000积分完全够用！")
     
-    # 启动3个线程
+    # 启动线程
     threading.Thread(target=monitor_auction, daemon=True).start()
     threading.Thread(target=monitor_robin, daemon=True).start()
     threading.Thread(target=monitor_aggr, daemon=True).start()
