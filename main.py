@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import threading
@@ -7,11 +8,11 @@ import tushare as ts
 from datetime import datetime, timedelta
 
 # ====================== 【全局配置】 ======================
-# 1. Tushare Pro 配置（替换为你的 Token）
+# 1. Tushare Pro 配置（请确保 TOKEN 有效）
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "393ff7d6c40fdc4d4974c979737f022551cc3c03eccfb2258cc85456")
 pro = ts.pro_api(TUSHARE_TOKEN)
 
-# 2. 微信推送配置
+# 2. 微信推送配置（企业微信群机器人）
 WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6c678ef5-de52-474e-95f9-96feaff4fb37")
 
 # 3. DeepSeek AI 配置
@@ -33,13 +34,17 @@ AGGR_VOL_RATIO_MIN = 2.5
 AGGR_TURNOVER_MAX = 12
 AGGR_AMOUNT_MIN = 2
 
-# 5. 持仓股列表
+# 5. 持仓股列表（用逗号分隔）
 HOLD_STOCK_LIST = [c.strip() for c in os.getenv("HOLD_STOCK_LIST", "").split(",") if c.strip()]
 
 # 6. 股票池配置（省积分版）
 AUCTION_POOL_SIZE = 20   # 竞价池缩小到20只
 ROBIN_POOL_SIZE = 50     # 稳健池缩小到50只
 AGGR_POOL_SIZE = 20      # 激进池缩小到20只
+
+# 7. 股票列表缓存文件（避免频繁调用 Tushare）
+STOCK_CACHE_FILE = "stock_basic_cache.json"
+CACHE_EXPIRE_DAYS = 7    # 每周更新一次
 
 # ====================== 工具函数 ======================
 def send_wechat(msg):
@@ -115,25 +120,65 @@ def is_auction_time(morning=True):
     
     return auction_start <= now <= auction_end
 
-# ====================== Tushare Pro 数据获取（修复 circ_mv 权限问题） ======================
+# ====================== Tushare Pro 数据获取（带本地缓存，彻底规避 circ_mv 权限问题） ======================
 def get_stock_basic():
-    """获取股票基础列表（去掉 circ_mv 字段，解决权限报错）"""
+    """
+    获取股票基础列表（使用本地缓存，每周更新一次）
+    彻底去掉 circ_mv 字段，避免权限报错
+    """
+    import traceback
+
+    # 尝试从缓存读取
+    if os.path.exists(STOCK_CACHE_FILE):
+        try:
+            with open(STOCK_CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+            cache_time = datetime.fromisoformat(cache['timestamp'])
+            # 如果缓存未过期，直接返回
+            if (datetime.now() - cache_time).days < CACHE_EXPIRE_DAYS:
+                print("使用本地缓存的股票列表")
+                return cache['data']
+        except Exception as e:
+            print(f"读取缓存文件失败：{e}，将重新获取")
+
+    # 缓存不存在或过期，从 Tushare 获取
     try:
-        # 获取基础列表（每周更一次，省积分）- 去掉 circ_mv 字段
+        print("从 Tushare 获取股票基础列表...")
         df = pro.stock_basic(
-            exchange='', 
-            list_status='L', 
-            fields='ts_code,symbol,name,industry,market'
+            exchange='',
+            list_status='L',
+            fields='ts_code,symbol,name,industry,market'   # 明确去掉 circ_mv
         )
-        # 只过滤有效数据，去掉市值过滤（权限问题）
+        # 过滤无效数据
         df = df[df['name'].notna()]
-        # 缓存股票名称映射
         stock_map = df[['ts_code', 'symbol', 'name']].to_dict('records')
+
+        # 保存到缓存文件
+        cache_data = {
+            'timestamp': datetime.now().isoformat(),
+            'data': stock_map
+        }
+        with open(STOCK_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+        print(f"成功获取 {len(stock_map)} 只股票，已缓存")
         return stock_map
+
     except Exception as e:
-        print(f"获取股票基础列表失败：{e}")
+        print("获取股票基础列表失败，详细错误：")
+        traceback.print_exc()   # 打印完整堆栈，便于定位
         send_wechat(f"❌ 获取股票列表失败：{str(e)[:50]}")
-        return []
+
+        # 如果获取失败但存在旧缓存（即使过期），返回旧缓存作为降级方案
+        if os.path.exists(STOCK_CACHE_FILE):
+            try:
+                with open(STOCK_CACHE_FILE, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                print("使用过期的缓存股票列表（降级方案）")
+                return cache['data']
+            except:
+                pass
+        return []   # 实在没有数据则返回空列表
 
 def get_auction_data_ts(stock_code):
     """获取竞价数据（官方接口）"""
@@ -190,7 +235,10 @@ def get_realtime_data_ts(stock_code):
             start_date=(datetime.now()-timedelta(days=5)).strftime("%Y%m%d"),
             end_date=today
         )
-        rise5d = (latest["close"] / df_5d.iloc[-5]["close"] - 1) * 100 if len(df_5d)>=5 else 0
+        if len(df_5d) >= 5:
+            rise5d = (latest["close"] / df_5d.iloc[-5]["close"] - 1) * 100
+        else:
+            rise5d = 0
         
         return {
             "ts_code": ts_code,
@@ -198,9 +246,9 @@ def get_realtime_data_ts(stock_code):
             "name": "",  # 从基础列表匹配
             "price": latest["close"],
             "avg_price": latest["close"],
-            "vol_ratio": latest["vol"] / df_5d["vol"].mean() if len(df_5d)>=5 else 1.0,
-            "turnover": latest["turnover_rate"],
-            "amount": latest["amount"] / 10000,
+            "vol_ratio": latest["vol"] / df_5d["vol"].mean() if len(df_5d) >= 5 else 1.0,
+            "turnover": latest.get("turnover_rate", 0),   # 注意：daily接口可能没有换手率，默认0
+            "amount": latest.get("amount", 0) / 10000,    # 转换为万元
             "low30": latest["low"],
             "rise5d": rise5d
         }
@@ -267,7 +315,7 @@ def scan_auction_ts(morning=True):
             # 生成AI分析提示词
             ai_prompt = f"请分析以下竞价选股结果，给出操作建议：\n"
             for s in verified[:3]:
-                ai_prompt += f"股票名称：{s['name']}，代码：{s['symbol']}，竞价价：{s['price']}，涨幅：{s['rise']}%\n"
+                ai_prompt += f"股票名称：{s['name']}，代码：{s['symbol']}，竞价价：{s['price']}，涨幅：{s['rise_auction']}%\n"
             # 调用AI分析
             ai_analysis = call_deepseek_ai(ai_prompt)
             # 推送结果+AI建议
@@ -416,7 +464,7 @@ def hold_analysis_ts():
             continue
         
         price = data["price"]
-        rise = (price / (price/1.01) - 1) * 100
+        rise = (price / (price/1.01) - 1) * 100   # 简易涨幅，需优化
         name = data["name"]
         
         if rise > 3:
