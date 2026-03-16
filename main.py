@@ -6,6 +6,7 @@ import requests
 import json
 import tushare as ts
 from datetime import datetime, timedelta
+import pytz  # 新增：处理时区
 
 # ====================== 【全局配置】 ======================
 # 1. Tushare Pro 配置（请确保 TOKEN 有效）
@@ -96,25 +97,37 @@ def call_deepseek_ai(prompt):
         print(f"AI调用异常：{e}")
         return "AI分析暂时不可用，请手动判断。"
 
+def get_beijing_time():
+    """新增：获取北京时间（解决GitHub时区问题）"""
+    tz = pytz.timezone('Asia/Shanghai')
+    return datetime.now(tz)
+
 def is_trading_time():
-    """判断是否为交易时间"""
-    now = datetime.now()
+    """修复：判断是否为A股交易时间（基于北京时间）"""
+    now = get_beijing_time()
+    # 排除周末
     if now.weekday() >= 5:
         return False
-    trade_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    trade_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
-    return trade_start <= now <= trade_end
+    # A股交易时间：9:30-11:30，13:00-15:00
+    trade_start_morning = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    trade_end_morning = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    trade_start_afternoon = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    trade_end_afternoon = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    return (trade_start_morning <= now <= trade_end_morning) or (trade_start_afternoon <= now <= trade_end_afternoon)
 
 def is_auction_time(morning=True):
-    """判断是否为竞价时间"""
-    now = datetime.now()
+    """修复：判断是否为竞价时间（基于北京时间）"""
+    now = get_beijing_time()
+    # 排除周末
     if now.weekday() >= 5:
         return False
     
     if morning:
+        # 早盘竞价：9:24-9:25
         auction_start = now.replace(hour=9, minute=24, second=0, microsecond=0)
         auction_end = now.replace(hour=9, minute=25, second=0, microsecond=0)
     else:
+        # 尾盘竞价：14:57-15:00
         auction_start = now.replace(hour=14, minute=57, second=0, microsecond=0)
         auction_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
     
@@ -185,8 +198,8 @@ def get_auction_data_ts(stock_code):
     try:
         # 转换代码格式：000001 → 000001.SZ
         ts_code = f"{stock_code}.SZ" if stock_code.startswith(("0", "3")) else f"{stock_code}.SH"
-        # 获取当日日期
-        today = datetime.now().strftime("%Y%m%d")
+        # 获取当日日期（北京时间）
+        today = get_beijing_time().strftime("%Y%m%d")
         df = pro.auction_detail(
             ts_code=ts_code,
             trade_date=today
@@ -211,7 +224,8 @@ def get_realtime_data_ts(stock_code):
     """获取实时行情（官方接口）"""
     try:
         ts_code = f"{stock_code}.SZ" if stock_code.startswith(("0", "3")) else f"{stock_code}.SH"
-        today = datetime.now().strftime("%Y%m%d")
+        # 获取当日日期（北京时间）
+        today = get_beijing_time().strftime("%Y%m%d")
         # 获取日线数据（替代实时，省积分）
         df = pro.daily(
             ts_code=ts_code,
@@ -220,9 +234,10 @@ def get_realtime_data_ts(stock_code):
         )
         if df.empty:
             # 取昨日数据兜底
+            yesterday = (get_beijing_time() - timedelta(days=1)).strftime("%Y%m%d")
             df = pro.daily(
                 ts_code=ts_code,
-                start_date=(datetime.now()-timedelta(days=1)).strftime("%Y%m%d"),
+                start_date=yesterday,
                 end_date=today
             )
         if df.empty:
@@ -230,9 +245,10 @@ def get_realtime_data_ts(stock_code):
         
         latest = df.iloc[0]
         # 获取5日线涨幅
+        five_days_ago = (get_beijing_time() - timedelta(days=5)).strftime("%Y%m%d")
         df_5d = pro.daily(
             ts_code=ts_code,
-            start_date=(datetime.now()-timedelta(days=5)).strftime("%Y%m%d"),
+            start_date=five_days_ago,
             end_date=today
         )
         if len(df_5d) >= 5:
@@ -346,7 +362,8 @@ def verify_open_5min_ts(auction_stocks):
     send_wechat("⏳ 验证竞价标的开盘强势度...")
     verified = []
     
-    while datetime.now().time() < datetime.strptime("09:35:00", "%H:%M:%S").time():
+    # 等待到北京时间9:35
+    while get_beijing_time().time() < datetime.strptime("09:35:00", "%H:%M:%S").time():
         time.sleep(10)
     
     for stock in auction_stocks[:AUCTION_POOL_SIZE]:
@@ -454,6 +471,10 @@ def hold_analysis_ts():
     if not HOLD_STOCK_LIST:
         return "暂无持仓股"
     
+    # 匹配股票名称
+    basic_stocks = get_stock_basic()
+    name_map = {s['symbol']: s['name'] for s in basic_stocks}
+    
     # 构建AI分析提示词
     ai_prompt = "请分析以下持仓股票的实时数据，给出具体的操作建议（持有/加仓/减仓/止损）：\n"
     for symbol in HOLD_STOCK_LIST:
@@ -463,6 +484,8 @@ def hold_analysis_ts():
             ai_prompt += f"{symbol}：获取数据失败\n"
             continue
         
+        # 补充股票名称
+        data["name"] = name_map.get(symbol, "")
         price = data["price"]
         rise = (price / (price/1.01) - 1) * 100   # 简易涨幅，需优化
         name = data["name"]
@@ -484,16 +507,29 @@ def hold_analysis_ts():
     msg += f"\n🤖 AI持仓分析建议：\n{ai_analysis}"
     return msg
 
-# ====================== 监控线程 ======================
+# ====================== 监控线程（修复循环逻辑，避免重复推送） ======================
 def monitor_auction():
-    """竞价监控线程"""
+    """竞价监控线程（修复：只在竞价时间执行一次）"""
     print("启动竞价监控（Tushare Pro+AI版）")
+    morning_auction_done = False  # 标记早盘竞价是否已执行
+    afternoon_auction_done = False  # 标记尾盘竞价是否已执行
+    
     while True:
-        if is_auction_time(morning=True):
+        now = get_beijing_time()
+        # 每天重置标记（凌晨0点）
+        if now.hour == 0 and now.minute == 0:
+            morning_auction_done = False
+            afternoon_auction_done = False
+        
+        # 早盘竞价：只执行一次
+        if is_auction_time(morning=True) and not morning_auction_done:
             scan_auction_ts(morning=True)
+            morning_auction_done = True  # 执行后标记为已完成
             time.sleep(60)
-        elif is_auction_time(morning=False):
+        # 尾盘竞价：只执行一次
+        elif is_auction_time(morning=False) and not afternoon_auction_done:
             scan_auction_ts(morning=False)
+            afternoon_auction_done = True  # 执行后标记为已完成
             time.sleep(30)
         else:
             time.sleep(60)
@@ -502,11 +538,26 @@ def monitor_robin():
     """稳健版监控线程（5分钟扫一次）"""
     print("启动稳健版监控（Tushare Pro+AI版）")
     last_push = 0
+    # 标记每日分析是否已推送
+    morning_analysis_done = False
+    noon_analysis_done = False
+    afternoon_analysis_done = False
+    close_analysis_done = False
+    
     while True:
+        now = get_beijing_time()
+        # 每天重置分析标记
+        if now.hour == 0 and now.minute == 0:
+            morning_analysis_done = False
+            noon_analysis_done = False
+            afternoon_analysis_done = False
+            close_analysis_done = False
+        
         if not is_trading_time():
             time.sleep(60)
             continue
         
+        # 盘中选股（5分钟一次）
         stocks = scan_robin_ts()
         if stocks and (time.time() - last_push) > 300:  # 5分钟推一次
             # 生成AI分析
@@ -522,15 +573,22 @@ def monitor_robin():
             send_wechat(msg)
             last_push = time.time()
         
-        now = datetime.now()
-        if now.hour == 9 and now.minute == 35:
+        # 早盘分析（9:35，只推一次）
+        if now.hour == 9 and now.minute == 35 and not morning_analysis_done:
             send_wechat(f"🌅 【早盘分析】\n{hold_analysis_ts()}")
-        elif now.hour == 11 and now.minute == 30:
+            morning_analysis_done = True
+        # 午盘小结（11:30，只推一次）
+        elif now.hour == 11 and now.minute == 30 and not noon_analysis_done:
             send_wechat(f"🍱 【午盘小结】\n{hold_analysis_ts()}")
-        elif now.hour == 14 and now.minute == 30:
+            noon_analysis_done = True
+        # 尾盘分析（14:30，只推一次）
+        elif now.hour == 14 and now.minute == 30 and not afternoon_analysis_done:
             send_wechat(f"🔥 【尾盘分析】\n{hold_analysis_ts()}")
-        elif now.hour == 15 and now.minute == 5:
+            afternoon_analysis_done = True
+        # 收盘总结（15:05，只推一次）
+        elif now.hour == 15 and now.minute == 5 and not close_analysis_done:
             send_wechat(f"📊 【收盘总结】\n{hold_analysis_ts()}")
+            close_analysis_done = True
         
         time.sleep(SCAN_INTERVAL)
 
@@ -562,8 +620,15 @@ def monitor_aggr():
 
 # ====================== 主函数 ======================
 if __name__ == "__main__":
+    # 安装pytz（解决GitHub Actions可能缺少的依赖）
+    try:
+        import pytz
+    except ImportError:
+        os.system("pip install pytz")
+        import pytz
+    
     # 启动通知
-    send_wechat("✅ 终极版监控系统（Tushare Pro+DeepSeek AI版）已启动\n修复circ_mv权限问题，2100积分足够稳定运行！")
+    send_wechat("✅ 尊敬的巴菲赖您好，您的股票助手已成功启动")
     
     # 启动所有线程
     threading.Thread(target=monitor_auction, daemon=True).start()
