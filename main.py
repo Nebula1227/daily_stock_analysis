@@ -8,14 +8,14 @@ from datetime import datetime, timedelta
 
 # ====================== 【全局配置】 ======================
 # 1. Tushare Pro 配置（替换为你的 Token）
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "你的Tushare Pro Token")
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "393ff7d6c40fdc4d4974c979737f022551cc3c03eccfb2258cc85456")
 pro = ts.pro_api(TUSHARE_TOKEN)
 
 # 2. 微信推送配置
-WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "你的微信机器人WebHook地址")
+WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=6c678ef5-de52-474e-95f9-96feaff4fb37")
 
 # 3. DeepSeek AI 配置
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "你的DeepSeek API Key")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-cbc802b64abd4ac0b6a1f96ed9c498f6")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
@@ -115,22 +115,18 @@ def is_auction_time(morning=True):
     
     return auction_start <= now <= auction_end
 
-# ====================== Tushare Pro 数据获取（官方版，稳定无报错） ======================
+# ====================== Tushare Pro 数据获取（修复 circ_mv 权限问题） ======================
 def get_stock_basic():
-    """获取股票基础列表（官方接口，无circ_mv报错）"""
+    """获取股票基础列表（去掉 circ_mv 字段，解决权限报错）"""
     try:
-        # 获取基础列表（每周更一次，省积分）
+        # 获取基础列表（每周更一次，省积分）- 去掉 circ_mv 字段
         df = pro.stock_basic(
             exchange='', 
             list_status='L', 
-            fields='ts_code,symbol,name,industry,market,circ_mv'
+            fields='ts_code,symbol,name,industry,market'
         )
-        # 过滤条件：市值30-150亿，价格≤20元
-        df = df[
-            (df['circ_mv'].notna()) & 
-            (df['circ_mv'] >= 30) & 
-            (df['circ_mv'] <= 150)
-        ]
+        # 只过滤有效数据，去掉市值过滤（权限问题）
+        df = df[df['name'].notna()]
         # 缓存股票名称映射
         stock_map = df[['ts_code', 'symbol', 'name']].to_dict('records')
         return stock_map
@@ -519,7 +515,7 @@ def monitor_aggr():
 # ====================== 主函数 ======================
 if __name__ == "__main__":
     # 启动通知
-    send_wechat("✅ 终极版监控系统（Tushare Pro+DeepSeek AI版）已启动\n2100积分足够稳定运行，AI智能分析加持！")
+    send_wechat("✅ 终极版监控系统（Tushare Pro+DeepSeek AI版）已启动\n修复circ_mv权限问题，2100积分足够稳定运行！")
     
     # 启动所有线程
     threading.Thread(target=monitor_auction, daemon=True).start()
